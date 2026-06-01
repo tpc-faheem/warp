@@ -67,10 +67,13 @@ pub fn is_in_repo(_path: &str, _app: &warpui::AppContext) -> bool {
 }
 pub use file_tree_store::FileTreeEntry;
 pub use file_tree_update::RepoMetadataUpdate;
-pub use local_model::{LocalRepoMetadataModel, RepoContent};
+pub use local_model::{LocalRepoMetadataModel, OwnedRepoContent, RepoContent};
 pub use remote_model::RemoteRepoMetadataModel;
 pub use repository_identifier::{RemoteRepositoryIdentifier, RepositoryIdentifier};
-pub use wrapper_model::{RepoMetadataEvent, RepoMetadataModel};
+pub use wrapper_model::{
+    query_local_repo_contents, RemoteMetadataQueryProvider, RepoContentsQueryBudget,
+    RepoContentsQueryError, RepoMetadataEvent, RepoMetadataModel, RepoMetadataQuery,
+};
 
 /// A wrapper around PathBuf that ensures the path is canonicalized.
 /// This helps avoid issues with symbolic links, relative paths, and different path representations.

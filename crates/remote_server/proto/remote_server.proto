@@ -40,6 +40,7 @@ message ClientMessage {
     GetBranches get_branches = 24;
     ResyncCodebase resync_codebase = 25;
     UploadHandoffSnapshot upload_handoff_snapshot = 26;
+    QueryRepoMetadata query_repo_metadata = 27;
   }
 }
 // Top-level envelope for all server → client messages.
@@ -73,6 +74,7 @@ message ServerMessage {
     GetFragmentMetadataFromHashResponse get_fragment_metadata_from_hash_response = 24;
     GetBranchesResponse get_branches_response = 25;
     UploadHandoffSnapshotResponse upload_handoff_snapshot_response = 26;
+    QueryRepoMetadataResponse query_repo_metadata_response = 27;
   }
 }
 
@@ -257,6 +259,45 @@ message LoadRepoMetadataDirectoryResponse {
   string repo_path = 1;
   string dir_path = 2;
   repeated RepoMetadataEntryUpdate entries = 3;
+}
+
+// ── QueryRepoMetadata ─────────────────────────────────────────────
+
+// Client → server: execute one bounded authoritative metadata discovery query.
+// Unlike LoadRepoMetadataDirectory, returned matches are not canonical directory listings.
+message QueryRepoMetadata {
+  string repo_path = 1;
+  RepoMetadataQuery query = 2;
+  uint64 max_entries_scanned = 3;
+}
+
+message RepoMetadataQuery {
+  oneof query {
+    ProjectSkillFilesQuery project_skill_files = 1;
+    FilesNamedQuery files_named = 2;
+  }
+}
+
+message ProjectSkillFilesQuery {
+  repeated string provider_paths = 1;
+}
+
+message FilesNamedQuery {
+  repeated string names = 1;
+}
+
+enum RepoMetadataQueryStatus {
+  REPO_METADATA_QUERY_STATUS_UNSPECIFIED = 0;
+  REPO_METADATA_QUERY_STATUS_COMPLETE = 1;
+  REPO_METADATA_QUERY_STATUS_BUDGET_EXCEEDED = 2;
+}
+
+// Server → client: matching nodes and explicit query completion state.
+// Matches are valid only when status is COMPLETE; budget failures return no matches.
+message QueryRepoMetadataResponse {
+  repeated RepoNodeMetadata matches = 1;
+  RepoMetadataQueryStatus status = 2;
+  uint64 max_entries_scanned = 3;
 }
 
 // ── File write/delete operations ──────────────────────────────────

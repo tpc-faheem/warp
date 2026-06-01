@@ -12,7 +12,10 @@ use ::ai::index::full_source_code_embedding::{
 };
 use remote_server::proto::OpenBufferSuccess;
 use repo_metadata::repositories::{DetectedRepositories, RepoDetectionSource};
-use repo_metadata::{RepoMetadataEvent, RepoMetadataModel, RepositoryIdentifier};
+use repo_metadata::{
+    query_local_repo_contents, RepoContentsQueryBudget, RepoContentsQueryError, RepoMetadataEvent,
+    RepoMetadataModel, RepositoryIdentifier,
+};
 use warp_core::channel::ChannelState;
 use warp_core::{safe_error, SessionId};
 use warp_files::{FileModel, FileModelEvent};
@@ -696,6 +699,9 @@ impl ServerModel {
             }
             Some(client_message::Message::LoadRepoMetadataDirectory(msg)) => {
                 self.handle_load_repo_metadata_directory(msg, &request_id, ctx)
+            }
+            Some(client_message::Message::QueryRepoMetadata(msg)) => {
+                self.handle_query_repo_metadata(msg, &request_id, conn_id, ctx)
             }
             Some(client_message::Message::WriteFile(msg)) => {
                 self.handle_write_file(msg, &request_id, conn_id, ctx)
@@ -1847,6 +1853,78 @@ impl ServerModel {
                 entries,
             },
         ))
+    }
+
+    /// Handles `QueryRepoMetadata` with bounded filesystem discovery.
+    ///
+    /// Query matches are returned to the caller only; they are not applied to
+    /// `RepoMetadataModel`, so explicit directory loading remains the sole
+    /// canonical-tree materialization RPC.
+    fn handle_query_repo_metadata(
+        &mut self,
+        msg: super::proto::QueryRepoMetadata,
+        request_id: &RequestId,
+        conn_id: ConnectionId,
+        ctx: &mut ModelContext<Self>,
+    ) -> HandlerOutcome {
+        let repo_path = match StandardizedPath::from_local_canonicalized(Path::new(&msg.repo_path))
+        {
+            Ok(path) => path,
+            Err(error) => {
+                return HandlerOutcome::Sync(server_message::Message::Error(ErrorResponse {
+                    code: ErrorCode::InvalidRequest.into(),
+                    message: format!("Invalid repo_path: {error}"),
+                }));
+            }
+        };
+        let Some(query) = msg
+            .query
+            .as_ref()
+            .and_then(super::repo_metadata_proto::proto_to_repo_metadata_query)
+        else {
+            return HandlerOutcome::Sync(server_message::Message::Error(ErrorResponse {
+                code: ErrorCode::InvalidRequest.into(),
+                message: "Missing or invalid repository metadata query".to_string(),
+            }));
+        };
+        let budget = RepoContentsQueryBudget {
+            max_entries_scanned: usize::try_from(msg.max_entries_scanned).unwrap_or(usize::MAX),
+        };
+        log::info!(
+            "Handling QueryRepoMetadata repo_path={} (request_id={request_id})",
+            msg.repo_path
+        );
+
+        let request_id_for_response = request_id.clone();
+        let handle = self.spawn_request_handler(
+            request_id.clone(),
+            async move { query_local_repo_contents(&repo_path, &query, budget) },
+            move |me, result, _ctx| {
+                let response = match result {
+                    Ok(matches) => {
+                        server_message::Message::QueryRepoMetadataResponse(
+                            super::repo_metadata_proto::query_repo_metadata_response_to_proto(
+                                &matches, budget,
+                            ),
+                        )
+                    }
+                    Err(RepoContentsQueryError::QueryBudgetExceeded { .. }) => {
+                        server_message::Message::QueryRepoMetadataResponse(
+                            super::repo_metadata_proto::query_repo_metadata_budget_exceeded_response_to_proto(
+                                budget,
+                            ),
+                        )
+                    }
+                    Err(error) => server_message::Message::Error(ErrorResponse {
+                        code: ErrorCode::Internal.into(),
+                        message: format!("Repository metadata query failed: {error}"),
+                    }),
+                };
+                me.send_server_message(Some(conn_id), Some(&request_id_for_response), response);
+            },
+            ctx,
+        );
+        HandlerOutcome::Async(Some(handle))
     }
 
     /// Handles `WriteFile` by registering the path and triggering an async

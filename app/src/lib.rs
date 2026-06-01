@@ -1553,9 +1553,11 @@ pub(crate) fn initialize_app(
                     RemoteServerManagerEvent::RepoMetadataSnapshot { host_id, update } => {
                         me.insert_remote_snapshot(host_id.clone(), update, ctx);
                     }
-                    RemoteServerManagerEvent::RepoMetadataUpdated { host_id, update }
-                    | RemoteServerManagerEvent::RepoMetadataDirectoryLoaded { host_id, update } => {
+                    RemoteServerManagerEvent::RepoMetadataUpdated { host_id, update } => {
                         me.apply_remote_incremental_update(host_id, update, ctx);
+                    }
+                    RemoteServerManagerEvent::RepoMetadataDirectoryLoaded { host_id, update } => {
+                        me.apply_remote_loaded_directory_update(host_id, update, ctx);
                     }
                     RemoteServerManagerEvent::HostDisconnected { host_id } => {
                         me.remove_remote_repositories_for_host(host_id, ctx);
