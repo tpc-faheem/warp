@@ -8,6 +8,9 @@ use repo_metadata::file_tree_update::{
     DirectoryNodeMetadata, FileNodeMetadata, FileTreeEntryUpdate, RepoMetadataUpdate,
     RepoNodeMetadata,
 };
+use repo_metadata::{
+    OwnedRepoContent, RepoContentsQueryBudget, RepoContentsQueryError, RepoMetadataQuery,
+};
 use warp_util::standardized_path::StandardizedPath;
 
 use crate::proto;
@@ -226,9 +229,6 @@ pub fn file_tree_children_to_proto_entries(
     dir_path: &StandardizedPath,
 ) -> Vec<proto::RepoMetadataEntryUpdate> {
     let children: Vec<_> = entry.child_paths(dir_path).cloned().collect();
-    if children.is_empty() {
-        return Vec::new();
-    }
 
     let mut subtree_metadata = Vec::with_capacity(children.len());
     for child_path in &children {
@@ -259,14 +259,127 @@ pub fn file_tree_children_to_proto_entries(
         }
     }
 
-    if subtree_metadata.is_empty() {
-        return Vec::new();
-    }
-
     vec![proto::RepoMetadataEntryUpdate {
         parent_path_to_replace: dir_path.to_string(),
         subtree_metadata,
     }]
+}
+
+pub fn repo_metadata_query_to_proto(query: RepoMetadataQuery) -> proto::RepoMetadataQuery {
+    let query = match query {
+        RepoMetadataQuery::ProjectSkillFiles { provider_paths } => {
+            proto::repo_metadata_query::Query::ProjectSkillFiles(proto::ProjectSkillFilesQuery {
+                provider_paths,
+            })
+        }
+        RepoMetadataQuery::FilesNamed { names } => {
+            proto::repo_metadata_query::Query::FilesNamed(proto::FilesNamedQuery { names })
+        }
+    };
+
+    proto::RepoMetadataQuery { query: Some(query) }
+}
+
+pub fn proto_to_repo_metadata_query(query: &proto::RepoMetadataQuery) -> Option<RepoMetadataQuery> {
+    match query.query.as_ref()? {
+        proto::repo_metadata_query::Query::ProjectSkillFiles(query) => {
+            Some(RepoMetadataQuery::ProjectSkillFiles {
+                provider_paths: query.provider_paths.clone(),
+            })
+        }
+        proto::repo_metadata_query::Query::FilesNamed(query) => {
+            Some(RepoMetadataQuery::FilesNamed {
+                names: query.names.clone(),
+            })
+        }
+    }
+}
+
+pub fn query_repo_metadata_response_to_proto(
+    matches: &[OwnedRepoContent],
+    budget: RepoContentsQueryBudget,
+) -> proto::QueryRepoMetadataResponse {
+    proto::QueryRepoMetadataResponse {
+        matches: matches.iter().map(owned_repo_content_to_proto).collect(),
+        status: proto::RepoMetadataQueryStatus::Complete as i32,
+        max_entries_scanned: budget.max_entries_scanned as u64,
+    }
+}
+
+pub fn query_repo_metadata_budget_exceeded_response_to_proto(
+    budget: RepoContentsQueryBudget,
+) -> proto::QueryRepoMetadataResponse {
+    proto::QueryRepoMetadataResponse {
+        matches: Vec::new(),
+        status: proto::RepoMetadataQueryStatus::BudgetExceeded as i32,
+        max_entries_scanned: budget.max_entries_scanned as u64,
+    }
+}
+
+pub fn proto_query_repo_metadata_response_to_contents(
+    response: &proto::QueryRepoMetadataResponse,
+) -> Result<Vec<OwnedRepoContent>, RepoContentsQueryError> {
+    let budget = response.max_entries_scanned as usize;
+    match proto::RepoMetadataQueryStatus::try_from(response.status).ok() {
+        Some(proto::RepoMetadataQueryStatus::Complete) => response
+            .matches
+            .iter()
+            .map(proto_to_owned_repo_content)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| RepoContentsQueryError::QueryFailed {
+                message: "remote metadata query returned an invalid match".to_string(),
+            }),
+        Some(proto::RepoMetadataQueryStatus::BudgetExceeded) => {
+            Err(RepoContentsQueryError::QueryBudgetExceeded { limit: budget })
+        }
+        Some(proto::RepoMetadataQueryStatus::Unspecified) | None => {
+            Err(RepoContentsQueryError::QueryFailed {
+                message: "remote metadata query returned an unspecified status".to_string(),
+            })
+        }
+    }
+}
+
+fn owned_repo_content_to_proto(content: &OwnedRepoContent) -> proto::RepoNodeMetadata {
+    let node = match content {
+        OwnedRepoContent::Directory {
+            path,
+            ignored,
+            loaded,
+        } => proto::repo_node_metadata::Node::Directory(proto::DirectoryNodeMetadata {
+            path: path.to_string(),
+            ignored: *ignored,
+            loaded: *loaded,
+        }),
+        OwnedRepoContent::File {
+            path,
+            extension,
+            ignored,
+        } => proto::repo_node_metadata::Node::File(proto::FileNodeMetadata {
+            path: path.to_string(),
+            extension: extension.clone(),
+            ignored: *ignored,
+        }),
+    };
+
+    proto::RepoNodeMetadata { node: Some(node) }
+}
+
+fn proto_to_owned_repo_content(node: &proto::RepoNodeMetadata) -> Option<OwnedRepoContent> {
+    match node.node.as_ref()? {
+        proto::repo_node_metadata::Node::Directory(directory) => {
+            Some(OwnedRepoContent::Directory {
+                path: StandardizedPath::try_new(&directory.path).ok()?,
+                ignored: directory.ignored,
+                loaded: directory.loaded,
+            })
+        }
+        proto::repo_node_metadata::Node::File(file) => Some(OwnedRepoContent::File {
+            path: StandardizedPath::try_new(&file.path).ok()?,
+            extension: file.extension.clone(),
+            ignored: file.ignored,
+        }),
+    }
 }
 
 fn proto_to_repo_node_metadata(proto_node: &proto::RepoNodeMetadata) -> Option<RepoNodeMetadata> {
@@ -289,3 +402,7 @@ fn proto_to_repo_node_metadata(proto_node: &proto::RepoNodeMetadata) -> Option<R
         }
     }
 }
+
+#[cfg(test)]
+#[path = "repo_metadata_proto_tests.rs"]
+mod tests;

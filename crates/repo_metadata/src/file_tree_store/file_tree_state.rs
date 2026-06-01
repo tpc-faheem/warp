@@ -197,6 +197,10 @@ impl FileTreeMapStore {
         });
 
         entry.load(gitignores)?;
+        let existing_children: Vec<_> = self.children(path).cloned().collect();
+        for child in existing_children {
+            self.remove(&child);
+        }
         self.insert_entry_at_path(child_path, entry);
         Ok(())
     }

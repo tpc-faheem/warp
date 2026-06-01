@@ -209,6 +209,32 @@ impl FileTreeEntry {
         }
     }
 
+    /// Replaces a materialized directory's immediate children with an authoritative listing.
+    ///
+    /// Lazy directory loads return a complete listing for one parent. Applying that result as a
+    /// patch would leave stale cached children behind and would not transition an empty directory
+    /// to loaded. This method preserves the lazy-tree invariant by making replacement explicit.
+    pub fn replace_loaded_directory_children(
+        &mut self,
+        directory_path: &StandardizedPath,
+        subtree_metadata: Vec<crate::file_tree_update::RepoNodeMetadata>,
+    ) -> bool {
+        let Some(FileTreeEntryState::Directory(directory)) = self.get_mut(directory_path) else {
+            return false;
+        };
+        directory.loaded = true;
+
+        let existing_children: Vec<_> = self.child_paths(directory_path).cloned().collect();
+        for child in existing_children {
+            self.remove(&child);
+        }
+
+        self.apply_entry_update(&crate::file_tree_update::FileTreeEntryUpdate {
+            parent_path_to_replace: directory_path.clone(),
+            subtree_metadata,
+        });
+        true
+    }
     fn apply_entry_update(&mut self, update: &crate::file_tree_update::FileTreeEntryUpdate) {
         use crate::file_tree_update::RepoNodeMetadata;
 

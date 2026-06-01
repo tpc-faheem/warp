@@ -8,7 +8,10 @@ use ai::skills::{
 use anyhow::Error;
 use repo_metadata::file_tree_update::RepoNodeMetadata;
 use repo_metadata::local_model::GetContentsArgs;
-use repo_metadata::{RepoContent, RepoMetadataModel, RepoMetadataUpdate, RepositoryIdentifier};
+use repo_metadata::{
+    OwnedRepoContent, RepoContent, RepoMetadataModel, RepoMetadataQuery, RepoMetadataUpdate,
+    RepositoryIdentifier,
+};
 use walkdir::{DirEntry, WalkDir};
 use warp_util::local_or_remote_path::LocalOrRemotePath;
 use warp_util::remote_path::RemotePath;
@@ -67,39 +70,23 @@ pub(super) fn update_might_affect_project_skills(
         })
     })
 }
-/// Finds project skill files and local symlinked skill files with one metadata traversal.
+/// Finds project skill files and local symlinked skill files from currently materialized metadata.
 ///
 /// Local provider directories are included in the metadata query so filesystem hydration can
 /// supplement indexed files with directory symlinks. Remote repositories only return indexed
-/// skill files because their filesystems are unavailable to the client.
+/// skill files because their filesystems are unavailable to the client. Asynchronous project
+/// refreshes use the authoritative query path before calling this conversion logic.
 pub(super) fn find_project_skill_files_in_tree(
     repo_id: &RepositoryIdentifier,
     repo_metadata: &RepoMetadataModel,
     ctx: &AppContext,
 ) -> Vec<LocalOrRemotePath> {
-    let include_local_provider_directories = matches!(repo_id, RepositoryIdentifier::Local(_));
-    let repo_id_for_filter = repo_id.clone();
-    let args = GetContentsArgs {
-        include_folders: include_local_provider_directories,
-        ..GetContentsArgs::default()
-    }
-    .include_ignored()
-    .with_filter(move |content| match content {
-        RepoContent::File(file) => {
-            let path = local_or_remote_path_for_repo_path(&repo_id_for_filter, &file.path);
-            extract_skill_parent_directory(&path).is_ok()
-        }
-        RepoContent::Directory(directory) => {
-            include_local_provider_directories
-                && is_project_provider_path(&directory.path.to_local_path_lossy())
-        }
-    });
-
+    let args = project_skill_query_args(repo_id);
     let mut skill_files = Vec::new();
     let mut local_provider_directories = Vec::new();
     for content in repo_metadata
-        .get_repo_contents(repo_id, args, ctx)
-        .unwrap_or_else(|_| Vec::new())
+        .get_loaded_repo_contents(repo_id, args, ctx)
+        .unwrap_or_default()
     {
         match content {
             RepoContent::File(file) => {
@@ -113,6 +100,69 @@ pub(super) fn find_project_skill_files_in_tree(
         }
     }
 
+    add_symlinked_local_skill_files(skill_files, local_provider_directories)
+}
+
+pub(super) fn project_skill_query_args(repo_id: &RepositoryIdentifier) -> GetContentsArgs {
+    let include_local_provider_directories = matches!(repo_id, RepositoryIdentifier::Local(_));
+    let repo_id_for_filter = repo_id.clone();
+    GetContentsArgs {
+        include_folders: include_local_provider_directories,
+        ..GetContentsArgs::default()
+    }
+    .include_ignored()
+    .with_filter(move |content| match content {
+        RepoContent::File(file) => {
+            let path = local_or_remote_path_for_repo_path(&repo_id_for_filter, &file.path);
+            extract_skill_parent_directory(&path).is_ok()
+        }
+        RepoContent::Directory(directory) => {
+            include_local_provider_directories
+                && is_project_provider_path(&directory.path.to_local_path_lossy())
+        }
+    })
+}
+
+pub(super) fn project_skill_query() -> RepoMetadataQuery {
+    RepoMetadataQuery::ProjectSkillFiles {
+        provider_paths: SKILL_PROVIDER_DEFINITIONS
+            .iter()
+            .map(|provider| {
+                provider
+                    .skills_path
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .collect(),
+    }
+}
+pub(super) fn find_project_skill_files_in_contents(
+    repo_id: &RepositoryIdentifier,
+    contents: Vec<OwnedRepoContent>,
+) -> Vec<LocalOrRemotePath> {
+    let mut skill_files = Vec::new();
+    let mut local_provider_directories = Vec::new();
+    for content in contents {
+        match content {
+            OwnedRepoContent::File { path, .. } => {
+                skill_files.push(local_or_remote_path_for_repo_path(repo_id, &path));
+            }
+            OwnedRepoContent::Directory { path, .. } => {
+                if let Some(path) = path.to_local_path() {
+                    local_provider_directories.push(path);
+                }
+            }
+        }
+    }
+    add_symlinked_local_skill_files(skill_files, local_provider_directories)
+}
+
+fn add_symlinked_local_skill_files(
+    mut skill_files: Vec<LocalOrRemotePath>,
+    local_provider_directories: Vec<PathBuf>,
+) -> Vec<LocalOrRemotePath> {
     skill_files.extend(
         find_symlinked_skill_files_in_local_provider_directories(local_provider_directories)
             .into_iter()

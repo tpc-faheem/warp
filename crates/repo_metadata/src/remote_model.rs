@@ -227,6 +227,43 @@ impl RemoteRepoMetadataModel {
             });
         }
     }
+
+    /// Applies an authoritative remote directory-load response.
+    ///
+    /// Unlike watcher-driven incremental updates, a directory-load response contains the
+    /// complete immediate-child listing for each requested directory, so existing children
+    /// must be replaced and the directory must transition to `loaded == true`.
+    pub fn apply_loaded_directory_update(
+        &mut self,
+        host_id: &HostId,
+        update: &RepoMetadataUpdate,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let matching_id = self
+            .repositories
+            .keys()
+            .find(|id| id.host_id == *host_id && id.path == update.repo_path)
+            .cloned();
+
+        let Some(id) = matching_id else {
+            log::warn!(
+                "No remote repository found for directory load update: {}",
+                update.repo_path
+            );
+            return;
+        };
+
+        let Some(IndexedRepoState::Indexed(state)) = self.repositories.get_mut(&id) else {
+            return;
+        };
+        for entry_update in &update.update_entries {
+            state.entry.replace_loaded_directory_children(
+                &entry_update.parent_path_to_replace,
+                entry_update.subtree_metadata.clone(),
+            );
+        }
+        ctx.emit(RemoteRepositoryMetadataEvent::FileTreeEntryUpdated { id });
+    }
 }
 
 impl warpui_core::Entity for RemoteRepoMetadataModel {

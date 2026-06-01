@@ -149,7 +149,7 @@ impl FileSearchModel {
                 let id = RepositoryIdentifier::Remote(remote_path.clone());
                 let repo_metadata = RepoMetadataModel::as_ref(app);
                 let Ok(contents) =
-                    repo_metadata.get_repo_contents(&id, GetContentsArgs::default(), app)
+                    repo_metadata.get_loaded_repo_contents(&id, GetContentsArgs::default(), app)
                 else {
                     return Vec::new();
                 };
@@ -237,6 +237,10 @@ impl FileSearchModel {
 
     /// Gets repository contents for a local or remote repo root, converting
     /// absolute paths to repo-relative `FileSearchResult`s.
+    ///
+    /// TODO: Consider an authoritative prefetched async repository-file cache for command
+    /// palette and `@` Repo Files after latency, query-budget, and loading UX policy are
+    /// defined. Current materialized-only snapshots are intentional.
     #[cfg(feature = "local_fs")]
     fn get_contents_from_repo(
         &self,
@@ -254,7 +258,7 @@ impl FileSearchModel {
                     return Vec::new();
                 };
                 let Ok(contents) =
-                    repo_metadata.get_repo_contents(&id, GetContentsArgs::default(), app)
+                    repo_metadata.get_loaded_repo_contents(&id, GetContentsArgs::default(), app)
                 else {
                     return Vec::new();
                 };
@@ -295,7 +299,7 @@ impl FileSearchModel {
             LocalOrRemotePath::Remote(remote_path) => {
                 let id = RepositoryIdentifier::Remote(remote_path.clone());
                 let Ok(contents) =
-                    repo_metadata.get_repo_contents(&id, GetContentsArgs::default(), app)
+                    repo_metadata.get_loaded_repo_contents(&id, GetContentsArgs::default(), app)
                 else {
                     return Vec::new();
                 };

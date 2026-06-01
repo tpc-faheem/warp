@@ -21,9 +21,10 @@ use crate::proto::{
     FileStatusInfo, FragmentMetadataLookupErrorCode, GetBranches, GetDiffState,
     GetDiffStateResponse, GetFragmentMetadataFromHash, GetFragmentMetadataFromHashSuccess,
     IndexCodebase, Initialize, InitializeResponse, LoadRepoMetadataDirectoryResponse,
-    NavigatedToDirectoryResponse, OpenBuffer, OpenBufferResponse, ReadFileContextRequest,
-    ReadFileContextResponse, ResyncCodebase, RunCommandRequest, RunCommandResponse, SaveBuffer,
-    ServerMessage, SessionBootstrapped, TextEdit, UnsubscribeDiffState, UploadHandoffSnapshot,
+    NavigatedToDirectoryResponse, OpenBuffer, OpenBufferResponse, QueryRepoMetadata,
+    QueryRepoMetadataResponse, ReadFileContextRequest, ReadFileContextResponse, RepoMetadataQuery,
+    ResyncCodebase, RunCommandRequest, RunCommandResponse, SaveBuffer, ServerMessage,
+    SessionBootstrapped, TextEdit, UnsubscribeDiffState, UploadHandoffSnapshot,
     UploadHandoffSnapshotResponse, WriteFile,
 };
 use crate::repo_metadata_proto::{proto_snapshot_to_update, proto_to_repo_metadata_update};
@@ -642,6 +643,44 @@ impl RemoteServerClient {
         }
     }
 
+    /// Executes a bounded authoritative repository metadata discovery query on the remote host.
+    pub async fn query_repo_metadata(
+        &self,
+        repo_path: String,
+        query: RepoMetadataQuery,
+        max_entries_scanned: u64,
+    ) -> Result<QueryRepoMetadataResponse, ClientError> {
+        let request_id = RequestId::new();
+        let msg = ClientMessage {
+            request_id: request_id.to_string(),
+            message: Some(client_message::Message::QueryRepoMetadata(
+                QueryRepoMetadata {
+                    repo_path,
+                    query: Some(query),
+                    max_entries_scanned,
+                },
+            )),
+        };
+
+        let response = self
+            .send_request(
+                request_id,
+                msg,
+                crate::manager::RemoteServerOperation::QueryRepoMetadata,
+            )
+            .await?;
+
+        match response.message {
+            Some(server_message::Message::QueryRepoMetadataResponse(resp)) => Ok(resp),
+            other => {
+                safe_error!(
+                    safe: ("Remote server unexpected response for QueryRepoMetadata"),
+                    full: ("Remote server unexpected response for QueryRepoMetadata: response={other:?}")
+                );
+                Err(ClientError::UnexpectedResponse)
+            }
+        }
+    }
     /// Writes content to a file on the remote host.
     /// Creates parent directories if they don't exist.
     pub async fn write_file(&self, path: String, content: String) -> Result<(), ClientError> {

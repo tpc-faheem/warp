@@ -7,19 +7,86 @@
 
 #[cfg(feature = "local_fs")]
 use std::path::Path;
+use std::sync::Arc;
 
+use futures::future::{self, BoxFuture, FutureExt as _};
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "local_fs")]
+use walkdir::WalkDir;
 use warp_core::HostId;
 use warp_util::standardized_path::StandardizedPath;
 use warpui_core::{AppContext, ModelContext, ModelHandle, SingletonEntity};
-
-use crate::file_tree_store::FileTreeState;
+use crate::file_tree_store::{FileTreeEntry, FileTreeEntryState, FileTreeState};
 use crate::file_tree_update::{MetadataUpdateType, RepoMetadataUpdate};
 use crate::local_model::{
-    GetContentsArgs, IndexedRepoState, LocalRepoMetadataModel, RepoContent, RepositoryMetadataEvent,
+    GetContentsArgs, IndexedRepoState, LocalRepoMetadataModel, OwnedRepoContent, RepoContent,
+    RepositoryMetadataEvent,
 };
 use crate::remote_model::{RemoteRepoMetadataModel, RemoteRepositoryMetadataEvent};
 use crate::repository_identifier::{RemoteRepositoryIdentifier, RepositoryIdentifier};
 use crate::RepoMetadataError;
+
+/// Maximum file-system traversal work permitted by an authoritative contents query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoContentsQueryBudget {
+    pub max_entries_scanned: usize,
+}
+
+impl Default for RepoContentsQueryBudget {
+    fn default() -> Self {
+        Self {
+            max_entries_scanned: 100_000,
+        }
+    }
+}
+
+/// Serializable descriptions of authoritative metadata discovery requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepoMetadataQuery {
+    /// Finds `SKILL.md` files below registered provider roots and returns provider directories
+    /// as well so local callers can supplement indexed paths with symlinked skill directories.
+    ProjectSkillFiles { provider_paths: Vec<String> },
+    /// Finds files whose basename equals one of the requested names.
+    FilesNamed { names: Vec<String> },
+}
+#[cfg(test)]
+#[path = "wrapper_model_tests.rs"]
+mod tests;
+
+/// Explicit failure states for completeness-aware repository-content queries.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum RepoContentsQueryError {
+    #[error("Repository metadata was not found for {0:?}")]
+    RepositoryNotFound(RepositoryIdentifier),
+    #[error("Repository metadata indexing is still pending for {0:?}")]
+    RepositoryPending(RepositoryIdentifier),
+    #[error("Repository metadata indexing failed for {id:?}: {message}")]
+    RepositoryIndexingFailed {
+        id: RepositoryIdentifier,
+        message: String,
+    },
+    #[error("No remote metadata query provider is available for {0:?}")]
+    RemoteQueryUnavailable(RemoteRepositoryIdentifier),
+    #[error("Repository metadata query failed: {message}")]
+    QueryFailed { message: String },
+    #[error("Repository metadata query budget exceeded after scanning {limit} entries")]
+    QueryBudgetExceeded { limit: usize },
+}
+
+/// App-provided transport boundary for authoritative remote metadata discovery.
+///
+/// `repo_metadata` owns query semantics; app-layer consumers supply a provider backed by the
+/// connected remote-server client without introducing a reverse crate dependency. Returned
+/// query matches are discovery output and do not mutate the canonical metadata tree.
+pub type RemoteMetadataQueryProvider = Arc<
+    dyn Fn(
+            RemoteRepositoryIdentifier,
+            RepoMetadataQuery,
+            RepoContentsQueryBudget,
+        ) -> BoxFuture<'static, Result<Vec<OwnedRepoContent>, RepoContentsQueryError>>
+        + Send
+        + Sync,
+>;
 
 /// Unified events emitted by the [`RepoMetadataModel`] wrapper.
 ///
@@ -186,6 +253,71 @@ impl RepoMetadataModel {
         }
     }
 
+    /// Returns authoritative repository contents for a typed query.
+    ///
+    /// A fully loaded canonical tree is used as an I/O-free fast path. Otherwise, local queries
+    /// scan the repository with a work budget and remote queries are delegated through an
+    /// app-provided query provider. Match-only authoritative results never modify canonical tree
+    /// children.
+    pub fn get_repo_contents(
+        &self,
+        id: RepositoryIdentifier,
+        query: RepoMetadataQuery,
+        budget: RepoContentsQueryBudget,
+        remote_query_provider: Option<RemoteMetadataQueryProvider>,
+        ctx: &AppContext,
+    ) -> BoxFuture<'static, Result<Vec<OwnedRepoContent>, RepoContentsQueryError>> {
+        let loaded_contents = match self.loaded_query_contents(&id, &query, ctx) {
+            Ok(contents) => contents,
+            Err(error) => return future::ready(Err(error)).boxed(),
+        };
+        if self
+            .get_repository(&id, ctx)
+            .is_some_and(|state| tree_is_fully_loaded(&state.entry, state.entry.root_directory()))
+        {
+            return future::ready(Ok(loaded_contents)).boxed();
+        }
+        match id {
+            RepositoryIdentifier::Local(repo_root) => {
+                async move { query_local_repo_contents(&repo_root, &query, budget) }.boxed()
+            }
+            RepositoryIdentifier::Remote(remote_id) => match remote_query_provider {
+                Some(provider) => provider(remote_id, query, budget),
+                None => future::ready(Err(RepoContentsQueryError::RemoteQueryUnavailable(
+                    remote_id,
+                )))
+                .boxed(),
+            },
+        }
+    }
+
+    fn loaded_query_contents(
+        &self,
+        id: &RepositoryIdentifier,
+        query: &RepoMetadataQuery,
+        ctx: &AppContext,
+    ) -> Result<Vec<OwnedRepoContent>, RepoContentsQueryError> {
+        match self.repository_state(id, ctx) {
+            Some(IndexedRepoState::Indexed(_)) => {}
+            Some(IndexedRepoState::Pending(_)) => {
+                return Err(RepoContentsQueryError::RepositoryPending(id.clone()));
+            }
+            Some(IndexedRepoState::Failed(error)) => {
+                return Err(RepoContentsQueryError::RepositoryIndexingFailed {
+                    id: id.clone(),
+                    message: error.to_string(),
+                });
+            }
+            None => return Err(RepoContentsQueryError::RepositoryNotFound(id.clone())),
+        }
+        Ok(self
+            .get_loaded_repo_contents(id, get_loaded_query_args(query.clone()), ctx)
+            .unwrap_or_default()
+            .iter()
+            .map(RepoContent::to_owned)
+            .collect())
+    }
+
     /// Returns whether the given repository is indexed.
     pub fn has_repository(&self, id: &RepositoryIdentifier, ctx: &AppContext) -> bool {
         match id {
@@ -233,10 +365,14 @@ impl RepoMetadataModel {
         }
     }
 
-    /// Returns repository contents for the specified repository.
+    /// Returns currently materialized repository contents without loading shallow directories.
     ///
-    /// Returns an error if the number of results exceeds MAX_REPO_CONTENTS_RESULTS.
-    pub fn get_repo_contents<'a>(
+    /// Consumers such as file search use this API intentionally so their existing latency and
+    /// breadth remain unchanged. Features that require complete discovery should use
+    /// [`Self::get_repo_contents`] instead.
+    ///
+    /// Returns an error if the number of materialized results exceeds MAX_REPO_CONTENTS_RESULTS.
+    pub fn get_loaded_repo_contents<'a>(
         &self,
         id: &RepositoryIdentifier,
         args: GetContentsArgs,
@@ -357,6 +493,23 @@ impl RepoMetadataModel {
         });
     }
 
+    /// Applies an authoritative remote directory-load response.
+    ///
+    /// Unlike incremental updates, a directory-load response replaces the
+    /// complete immediate-child listing for each loaded directory and marks
+    /// it `loaded == true`.
+    pub fn apply_remote_loaded_directory_update(
+        &self,
+        host_id: &HostId,
+        update: &RepoMetadataUpdate,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let host_id = host_id.clone();
+        self.remote.update(ctx, |remote, ctx| {
+            remote.apply_loaded_directory_update(&host_id, update, ctx);
+        });
+    }
+
     /// Removes all remote repositories for the given host (e.g. on disconnect).
     pub fn remove_remote_repositories_for_host(
         &self,
@@ -409,6 +562,147 @@ impl warpui_core::Entity for RepoMetadataModel {
 }
 
 impl SingletonEntity for RepoMetadataModel {}
+
+fn tree_is_fully_loaded(entry: &FileTreeEntry, current_path: &StandardizedPath) -> bool {
+    let Some(FileTreeEntryState::Directory(directory)) = entry.get(current_path) else {
+        return true;
+    };
+    if !directory.loaded {
+        return false;
+    }
+    entry
+        .child_paths(current_path)
+        .all(|child| tree_is_fully_loaded(entry, child))
+}
+
+fn get_loaded_query_args(query: RepoMetadataQuery) -> GetContentsArgs {
+    let include_folders = matches!(query, RepoMetadataQuery::ProjectSkillFiles { .. });
+    GetContentsArgs {
+        include_folders,
+        ..GetContentsArgs::default()
+    }
+    .include_ignored()
+    .with_filter(move |content| repo_content_matches_query(content, &query))
+}
+
+fn repo_content_matches_query(content: &RepoContent<'_>, query: &RepoMetadataQuery) -> bool {
+    match content {
+        RepoContent::File(file) => query_matches_path(&file.path, false, query),
+        RepoContent::Directory(directory) => query_matches_path(&directory.path, true, query),
+    }
+}
+
+fn query_matches_path(
+    path: &StandardizedPath,
+    is_directory: bool,
+    query: &RepoMetadataQuery,
+) -> bool {
+    match query {
+        RepoMetadataQuery::ProjectSkillFiles { provider_paths } => {
+            if is_directory {
+                return provider_paths
+                    .iter()
+                    .any(|provider_path| path_has_component_suffix(path, provider_path));
+            }
+            path.file_name() == Some("SKILL.md")
+                && path
+                    .parent()
+                    .and_then(|skill_directory| skill_directory.parent())
+                    .is_some_and(|skills_root| {
+                        provider_paths.iter().any(|provider_path| {
+                            path_has_component_suffix(&skills_root, provider_path)
+                        })
+                    })
+        }
+        RepoMetadataQuery::FilesNamed { names } => {
+            !is_directory
+                && path
+                    .file_name()
+                    .is_some_and(|file_name| names.iter().any(|name| name == file_name))
+        }
+    }
+}
+
+fn path_has_component_suffix(path: &StandardizedPath, suffix: &str) -> bool {
+    let mut candidate = Some(path.clone());
+    for expected in suffix
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .rev()
+    {
+        let Some(current) = candidate else {
+            return false;
+        };
+        if current.file_name() != Some(expected) {
+            return false;
+        }
+        candidate = current.parent();
+    }
+    true
+}
+
+#[cfg(feature = "local_fs")]
+/// Runs bounded authoritative local discovery without mutating any loaded metadata tree.
+pub fn query_local_repo_contents(
+    repo_root: &StandardizedPath,
+    query: &RepoMetadataQuery,
+    budget: RepoContentsQueryBudget,
+) -> Result<Vec<OwnedRepoContent>, RepoContentsQueryError> {
+    let local_root =
+        repo_root
+            .to_local_path()
+            .ok_or_else(|| RepoContentsQueryError::QueryFailed {
+                message: format!("Local repository path has incompatible encoding: {repo_root}"),
+            })?;
+    let mut matches = Vec::new();
+    let mut entries = WalkDir::new(local_root).follow_links(false).into_iter();
+    let mut entries_scanned = 0usize;
+    while let Some(entry) = entries.next() {
+        let entry = entry.map_err(|error| RepoContentsQueryError::QueryFailed {
+            message: error.to_string(),
+        })?;
+        if entry.file_type().is_dir() && entry.file_name() == ".git" {
+            entries.skip_current_dir();
+            continue;
+        }
+        if entries_scanned >= budget.max_entries_scanned {
+            return Err(RepoContentsQueryError::QueryBudgetExceeded {
+                limit: budget.max_entries_scanned,
+            });
+        }
+        entries_scanned += 1;
+        let path = StandardizedPath::try_from_local(entry.path()).map_err(|error| {
+            RepoContentsQueryError::QueryFailed {
+                message: error.to_string(),
+            }
+        })?;
+        if entry.file_type().is_dir() && query_matches_path(&path, true, query) {
+            matches.push(OwnedRepoContent::Directory {
+                path,
+                ignored: false,
+                loaded: false,
+            });
+        } else if entry.file_type().is_file() && query_matches_path(&path, false, query) {
+            matches.push(OwnedRepoContent::File {
+                extension: path.extension().map(ToOwned::to_owned),
+                path,
+                ignored: false,
+            });
+        }
+    }
+    Ok(matches)
+}
+
+#[cfg(not(feature = "local_fs"))]
+pub fn query_local_repo_contents(
+    _repo_root: &StandardizedPath,
+    _query: &RepoMetadataQuery,
+    _budget: RepoContentsQueryBudget,
+) -> Result<Vec<OwnedRepoContent>, RepoContentsQueryError> {
+    Err(RepoContentsQueryError::QueryFailed {
+        message: "Local filesystem metadata queries are unavailable".to_string(),
+    })
+}
 
 #[cfg(any(test, feature = "test-util"))]
 impl RepoMetadataModel {

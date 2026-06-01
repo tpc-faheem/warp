@@ -19,6 +19,37 @@ pub enum RepoContent<'a> {
     File(&'a FileTreeFileMetadata),
     Directory(&'a FileTreeDirectoryEntryState),
 }
+/// Owned metadata returned from completeness-aware asynchronous repository queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnedRepoContent {
+    File {
+        path: StandardizedPath,
+        extension: Option<String>,
+        ignored: bool,
+    },
+    Directory {
+        path: StandardizedPath,
+        ignored: bool,
+        loaded: bool,
+    },
+}
+
+impl RepoContent<'_> {
+    pub(crate) fn to_owned(&self) -> OwnedRepoContent {
+        match self {
+            Self::File(file) => OwnedRepoContent::File {
+                path: file.path.as_ref().clone(),
+                extension: file.extension.clone(),
+                ignored: file.ignored,
+            },
+            Self::Directory(directory) => OwnedRepoContent::Directory {
+                path: directory.path.as_ref().clone(),
+                ignored: directory.ignored,
+                loaded: directory.loaded,
+            },
+        }
+    }
+}
 
 use warp_util::standardized_path::StandardizedPath;
 
@@ -185,6 +216,7 @@ pub(crate) enum FileTreeMutation {
 /// A filter function for filtering repo contents during traversal.
 type RepoContentFilter = dyn for<'a> Fn(&RepoContent<'a>) -> bool + Send + Sync;
 
+#[derive(Clone)]
 pub struct GetContentsArgs {
     pub include_folders: bool,
     pub include_ignored: bool,

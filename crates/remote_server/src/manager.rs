@@ -112,6 +112,7 @@ pub enum RemoteServerInitPhase {
 pub enum RemoteServerOperation {
     NavigateToDirectory,
     LoadRepoMetadataDirectory,
+    QueryRepoMetadata,
     IndexCodebase,
     ResyncCodebase,
     DropCodebaseIndex,

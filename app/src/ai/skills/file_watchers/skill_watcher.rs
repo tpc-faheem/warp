@@ -1,20 +1,22 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ai::skills::{
     get_provider_for_path, home_skills_path, parse_skill, parse_skill_content_at_location,
     ParsedSkill, SkillProvider, SkillScope, SKILL_PROVIDER_DEFINITIONS,
 };
 use async_channel::Sender;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, FutureExt as _};
 use remote_server::proto::{
     file_context_proto, FileContextProto, ReadFileContextFile, ReadFileContextRequest,
 };
 use repo_metadata::repositories::DetectedRepositories;
 use repo_metadata::repository::{Repository, SubscriberId};
 use repo_metadata::{
-    DirectoryWatcher, MetadataUpdateType, RepoMetadataModel, RepositoryIdentifier, RepositoryUpdate,
+    DirectoryWatcher, MetadataUpdateType, RemoteMetadataQueryProvider, RepoContentsQueryBudget,
+    RepoContentsQueryError, RepoMetadataModel, RepositoryIdentifier, RepositoryUpdate,
 };
 use warp_util::local_or_remote_path::LocalOrRemotePath;
 use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
@@ -24,11 +26,15 @@ use super::subscribers::{
     HomeSkillSubscriber, ProjectSkillSubscriber, SkillRepositoryMessage, SymlinkSkillSubscriber,
 };
 use super::utils::{
-    find_project_skill_files_in_tree, is_home_provider_path, is_home_skill_directory,
-    is_skill_file, read_local_project_skills_from_filesystem, read_skills_from_directories,
+    find_project_skill_files_in_contents, find_project_skill_files_in_tree, is_home_provider_path,
+    is_home_skill_directory, is_skill_file, project_skill_query,
+    read_local_project_skills_from_filesystem, read_skills_from_directories,
     read_skills_from_files, update_might_affect_project_skills,
 };
 use crate::remote_server::manager::RemoteServerManager;
+use crate::remote_server::repo_metadata_proto::{
+    proto_query_repo_metadata_response_to_contents, repo_metadata_query_to_proto,
+};
 use crate::warp_managed_paths_watcher::{
     filter_repository_update_by_prefix, warp_managed_skill_dirs, WarpManagedPathsWatcher,
     WarpManagedPathsWatcherEvent,
@@ -42,6 +48,7 @@ pub enum SkillWatcherEvent {
 
 const REMOTE_SKILL_MAX_FILE_BYTES: u32 = 1024 * 1024;
 const REMOTE_SKILL_MAX_BATCH_BYTES: u32 = 5 * 1024 * 1024;
+const PROJECT_SKILL_MAX_ENTRIES_SCANNED: usize = 100_000;
 type ProjectSkillContentsFuture =
     BoxFuture<'static, anyhow::Result<Vec<(LocalOrRemotePath, String)>>>;
 pub struct SkillWatcher {
@@ -239,16 +246,44 @@ impl SkillWatcher {
         ctx: &mut ModelContext<Self>,
     ) {
         let refresh_generation = self.advance_project_skill_refresh_generation(repo_id);
-        let current_skill_files: HashSet<LocalOrRemotePath> = {
-            let repo_metadata = RepoMetadataModel::as_ref(ctx);
-            find_project_skill_files_in_tree(repo_id, repo_metadata, ctx)
-                .into_iter()
-                .collect()
-        };
+        let repo_id = repo_id.clone();
+        let remote_query_provider = remote_project_metadata_query_provider(&repo_id, ctx);
+        let query = RepoMetadataModel::as_ref(ctx).get_repo_contents(
+            repo_id.clone(),
+            project_skill_query(),
+            RepoContentsQueryBudget {
+                max_entries_scanned: PROJECT_SKILL_MAX_ENTRIES_SCANNED,
+            },
+            remote_query_provider,
+            ctx,
+        );
+        ctx.spawn(query, move |me, result, ctx| match result {
+            Ok(contents) => {
+                let current_skill_files = find_project_skill_files_in_contents(&repo_id, contents);
+                me.apply_project_skill_discovery(
+                    repo_id,
+                    refresh_generation,
+                    current_skill_files.into_iter().collect(),
+                    ctx,
+                );
+            }
+            Err(err) => log::warn!("Failed to discover project skills: {err}"),
+        });
+    }
 
+    fn apply_project_skill_discovery(
+        &mut self,
+        repo_id: RepositoryIdentifier,
+        refresh_generation: u64,
+        current_skill_files: HashSet<LocalOrRemotePath>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self.project_skill_refresh_generations.get(&repo_id) != Some(&refresh_generation) {
+            return;
+        }
         let previous_skill_files = self
             .project_skill_files_by_repo
-            .get(repo_id)
+            .get(&repo_id)
             .cloned()
             .unwrap_or_default();
 
@@ -280,7 +315,7 @@ impl SkillWatcher {
         );
 
         self.project_skill_files_by_repo
-            .insert(repo_id.clone(), current_skill_files);
+            .insert(repo_id, current_skill_files);
     }
 
     fn advance_project_skill_refresh_generation(&mut self, repo_id: &RepositoryIdentifier) -> u64 {
@@ -1057,6 +1092,35 @@ impl SkillWatcher {
     }
 }
 
+fn remote_project_metadata_query_provider(
+    repo_id: &RepositoryIdentifier,
+    ctx: &AppContext,
+) -> Option<RemoteMetadataQueryProvider> {
+    let RepositoryIdentifier::Remote(remote_id) = repo_id else {
+        return None;
+    };
+    let client = RemoteServerManager::as_ref(ctx)
+        .client_for_host(&remote_id.host_id)?
+        .clone();
+
+    Some(Arc::new(move |remote_id, query, budget| {
+        let client = client.clone();
+        async move {
+            let response = client
+                .query_repo_metadata(
+                    remote_id.path.to_string(),
+                    repo_metadata_query_to_proto(query),
+                    budget.max_entries_scanned as u64,
+                )
+                .await
+                .map_err(|err| RepoContentsQueryError::QueryFailed {
+                    message: err.to_string(),
+                })?;
+            proto_query_repo_metadata_response_to_contents(&response)
+        }
+        .boxed()
+    }))
+}
 fn read_project_skill_contents(
     skill_paths: Vec<LocalOrRemotePath>,
     ctx: &AppContext,
