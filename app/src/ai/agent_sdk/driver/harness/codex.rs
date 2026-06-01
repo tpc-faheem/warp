@@ -19,8 +19,8 @@ use super::super::terminal::{CommandHandle, TerminalDriver};
 use super::super::{AgentDriver, AgentDriverError};
 use super::claude_transcript::read_jsonl;
 use super::codex_transcript::{
-    codex_sessions_root, find_session_file, parse_session_meta, write_envelope, CodexResumeInfo,
-    CodexTranscriptEnvelope,
+    codex_sessions_root, find_session_file, parse_session_meta, rehydrate_for_local_resume,
+    CodexResumeInfo, CodexTranscriptEnvelope,
 };
 use super::json_utils::read_json_file_or_default;
 use super::{
@@ -228,19 +228,15 @@ impl CodexHarnessRunner {
             Some(CodexResumeInfo {
                 conversation_id,
                 session_id,
-                envelope,
+                mut envelope,
             }) => {
-                let sessions_root = codex_sessions_root().map_err(|e| {
-                    AgentDriverError::ConfigBuildFailed(
-                        e.context("Failed to resolve codex sessions root"),
-                    )
-                })?;
-                let path = write_envelope(&envelope, &sessions_root).map_err(|e| {
-                    AgentDriverError::ConfigBuildFailed(
-                        e.context("Failed to rehydrate codex transcript"),
-                    )
-                })?;
-                (Some(session_id), Some(conversation_id), Some(path))
+                let continuation = rehydrate_for_local_resume(&mut envelope, _working_dir)
+                    .map_err(AgentDriverError::ConfigBuildFailed)?;
+                (
+                    Some(session_id),
+                    Some(conversation_id),
+                    Some(continuation.transcript_path),
+                )
             }
             None => (None, None, None),
         };
