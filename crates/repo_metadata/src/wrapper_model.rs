@@ -313,7 +313,9 @@ impl RepoMetadataModel {
         }
         Ok(self
             .get_loaded_repo_contents(id, get_loaded_query_args(query.clone()), ctx)
-            .unwrap_or_default()
+            .map_err(|error| RepoContentsQueryError::QueryFailed {
+                message: error.to_string(),
+            })?
             .iter()
             .map(RepoContent::to_owned)
             .collect())

@@ -264,3 +264,49 @@ fn fully_loaded_remote_query_uses_loaded_tree_without_remote_provider() {
         ));
     });
 }
+
+#[test]
+fn fully_loaded_remote_query_propagates_loaded_result_limit_failure() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| DetectedRepositories::default());
+        let model = app.add_model(RepoMetadataModel::new);
+        let host_id = HostId::new("host".to_string());
+        let repo_path = StandardizedPath::try_new("/repo").unwrap();
+        let remote_id = RemoteRepositoryIdentifier::new(host_id, repo_path.clone());
+        let id = RepositoryIdentifier::Remote(remote_id.clone());
+        let children = (0..=100)
+            .map(|index| {
+                let path = format!("/repo/path-{index}/WARP.md");
+                file(StandardizedPath::try_new(&path).unwrap())
+            })
+            .collect();
+        let state = FileTreeState::new(
+            directory(repo_path, true, children),
+            Vec::new(),
+            None,
+        );
+        model.update(&mut app, |model, ctx| {
+            model.remote.update(ctx, |remote, _| {
+                remote.insert_test_state(remote_id, state);
+            });
+        });
+
+        let query = model.update(&mut app, |model, ctx| {
+            model.get_repo_contents(
+                id,
+                RepoMetadataQuery::FilesNamed {
+                    names: vec!["WARP.md".to_string()],
+                },
+                RepoContentsQueryBudget::default(),
+                None,
+                ctx,
+            )
+        });
+
+        assert!(matches!(
+            query.await,
+            Err(RepoContentsQueryError::QueryFailed { message })
+                if message == "Result size exceeded maximum limit of 100"
+        ));
+    });
+}
