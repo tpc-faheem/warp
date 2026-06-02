@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod auth;
 pub mod block;
+#[cfg(not(target_family = "wasm"))]
 pub(crate) mod download;
 pub mod harness_support;
 pub mod integrations;
