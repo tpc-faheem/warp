@@ -25,8 +25,8 @@ use super::subscribers::{
     HomeSkillSubscriber, ProjectSkillSubscriber, SkillRepositoryMessage, SymlinkSkillSubscriber,
 };
 use super::utils::{
-    find_project_skill_files_in_contents, find_project_skill_files_in_tree, is_home_provider_path,
-    is_home_skill_directory, is_skill_file, project_skill_query,
+    find_local_project_skill_files_in_loaded_tree, find_project_skill_files_in_contents,
+    is_home_provider_path, is_home_skill_directory, is_skill_file, project_skill_query,
     read_local_project_skills_from_filesystem, read_skills_from_directories,
     read_skills_from_files, update_might_affect_project_skills,
 };
@@ -84,7 +84,11 @@ pub struct SkillWatcher {
 }
 
 impl SkillWatcher {
-    /// Synchronously reads skills from the given local repo paths.
+    /// Synchronously reads skills from locally cloned agent environment repositories.
+    ///
+    /// These repositories are represented by local paths on the host running the agent,
+    /// even when the agent itself is running in a cloud environment. Normal interactive
+    /// project-skill refreshes use the asynchronous authoritative query path instead.
     /// Requires file trees to already be built (i.e. `RepositoryUpdated` has fired).
     /// Returns the parsed skills; the caller is responsible for feeding them into
     /// `SkillManager::handle_skills_added`.
@@ -96,7 +100,9 @@ impl SkillWatcher {
         let skill_files: Vec<PathBuf> = repo_paths
             .iter()
             .filter_map(|repo_path| RepositoryIdentifier::try_local(repo_path))
-            .flat_map(|repo_id| find_project_skill_files_in_tree(&repo_id, repo_metadata, ctx))
+            .flat_map(|repo_id| {
+                find_local_project_skill_files_in_loaded_tree(&repo_id, repo_metadata, ctx)
+            })
             .filter_map(|path| path.to_local_path().map(Path::to_path_buf))
             .collect();
         read_skills_from_files(skill_files)

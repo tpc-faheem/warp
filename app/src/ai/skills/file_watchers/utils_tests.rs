@@ -10,15 +10,15 @@ use repo_metadata::{
     DirectoryWatcher, RepoMetadataModel, RepoMetadataUpdate, RepositoryIdentifier,
 };
 use virtual_fs::{Stub, VirtualFS};
-use warp_util::host_id::HostId;
 use warp_util::local_or_remote_path::LocalOrRemotePath;
 use warp_util::remote_path::RemotePath;
 use warp_util::standardized_path::StandardizedPath;
+use warp_util::HostId;
 use warpui::App;
 
 use super::{
-    extract_skill_parent_directory, find_project_skill_files_in_tree, is_home_provider_path,
-    is_home_skill_directory, is_skill_file, read_skills_from_files,
+    extract_skill_parent_directory, find_local_project_skill_files_in_loaded_tree,
+    is_home_provider_path, is_home_skill_directory, is_skill_file, read_skills_from_files,
     update_might_affect_project_skills,
 };
 
@@ -431,11 +431,11 @@ fn is_home_provider_path_false_for_partial_path() {
 }
 
 // ============================================================================
-// Tests for find_skill_files_in_tree
+// Tests for find_local_project_skill_files_in_loaded_tree
 // ============================================================================
 
 #[test]
-fn find_skill_files_in_tree_finds_root_skills() {
+fn find_local_project_skill_files_in_loaded_tree_finds_root_skills() {
     VirtualFS::test("find_root_skills", |dirs, mut vfs| {
         let repo = dirs.tests().join("repo");
 
@@ -546,7 +546,8 @@ fn find_skill_files_in_tree_finds_root_skills() {
 
             model_handle.read(&app, |model, ctx| {
                 let repo_id = RepositoryIdentifier::try_local(&repo).unwrap();
-                let skill_files = find_project_skill_files_in_tree(&repo_id, model, ctx);
+                let skill_files =
+                    find_local_project_skill_files_in_loaded_tree(&repo_id, model, ctx);
                 assert_eq!(skill_files.len(), 2);
                 assert!(skill_files.contains(&LocalOrRemotePath::Local(
                     repo.join(".agents/skills/root-skill-1/SKILL.md")
@@ -698,7 +699,7 @@ fn update_relevance_filters_remote_updates_by_skill_file_paths() {
 }
 
 #[test]
-fn find_skill_files_in_tree_finds_subdirectory_skills() {
+fn find_local_project_skill_files_in_loaded_tree_finds_subdirectory_skills() {
     VirtualFS::test("find_subdir_skills", |dirs, mut vfs| {
         let repo = dirs.tests().join("repo");
 
@@ -827,7 +828,8 @@ fn find_skill_files_in_tree_finds_subdirectory_skills() {
 
             model_handle.read(&app, |model, ctx| {
                 let repo_id = RepositoryIdentifier::try_local(&repo).unwrap();
-                let skill_files = find_project_skill_files_in_tree(&repo_id, model, ctx);
+                let skill_files =
+                    find_local_project_skill_files_in_loaded_tree(&repo_id, model, ctx);
                 assert_eq!(skill_files.len(), 2);
                 assert!(skill_files.contains(&LocalOrRemotePath::Local(
                     repo.join(".agents/skills/root-skill/SKILL.md")
@@ -851,66 +853,7 @@ fn find_skill_files_in_tree_finds_subdirectory_skills() {
 }
 
 #[test]
-fn find_skill_files_in_tree_returns_remote_skill_paths_for_remote_repos() {
-    App::test((), |mut app| async move {
-        app.add_singleton_model(|_| DetectedRepositories::default());
-        let model_handle = app.add_singleton_model(RepoMetadataModel::new);
-        let host_id = HostId::new("test-host".to_string());
-        let repo_path = StandardizedPath::try_new("/repo").unwrap();
-        let skill_path =
-            StandardizedPath::try_new("/repo/.agents/skills/remote-skill/SKILL.md").unwrap();
-        let repo_id =
-            RepositoryIdentifier::Remote(RemotePath::new(host_id.clone(), repo_path.clone()));
-
-        let update = RepoMetadataUpdate {
-            repo_path: repo_path.clone(),
-            remove_entries: vec![],
-            update_entries: vec![FileTreeEntryUpdate {
-                parent_path_to_replace: repo_path.clone(),
-                subtree_metadata: vec![
-                    RepoNodeMetadata::Directory(DirectoryNodeMetadata {
-                        path: StandardizedPath::try_new("/repo/.agents").unwrap(),
-                        ignored: false,
-                        loaded: true,
-                    }),
-                    RepoNodeMetadata::Directory(DirectoryNodeMetadata {
-                        path: StandardizedPath::try_new("/repo/.agents/skills").unwrap(),
-                        ignored: false,
-                        loaded: true,
-                    }),
-                    RepoNodeMetadata::Directory(DirectoryNodeMetadata {
-                        path: StandardizedPath::try_new("/repo/.agents/skills/remote-skill")
-                            .unwrap(),
-                        ignored: false,
-                        loaded: true,
-                    }),
-                    RepoNodeMetadata::File(FileNodeMetadata {
-                        path: skill_path.clone(),
-                        extension: Some("md".to_string()),
-                        ignored: false,
-                    }),
-                ],
-            }],
-        };
-
-        model_handle.update(&mut app, |model, ctx| {
-            model.insert_remote_snapshot(host_id.clone(), &update, ctx);
-        });
-
-        model_handle.read(&app, |model, ctx| {
-            let skill_files = find_project_skill_files_in_tree(&repo_id, model, ctx);
-            assert_eq!(
-                skill_files,
-                vec![LocalOrRemotePath::Remote(RemotePath::new(
-                    host_id, skill_path
-                ))]
-            );
-        });
-    });
-}
-
-#[test]
-fn find_skill_files_in_tree_includes_ignored_skill_files() {
+fn find_local_project_skill_files_in_loaded_tree_includes_ignored_skill_files() {
     VirtualFS::test("find_skills_ignored", |dirs, mut vfs| {
         let repo = dirs.tests().join("repo");
         vfs.mkdir("repo/.agents/skills/ignored-skill")
@@ -970,7 +913,7 @@ fn find_skill_files_in_tree_includes_ignored_skill_files() {
             model_handle.read(&app, |model, ctx| {
                 let repo_id = RepositoryIdentifier::try_local(&repo).unwrap();
                 assert_eq!(
-                    find_project_skill_files_in_tree(&repo_id, model, ctx),
+                    find_local_project_skill_files_in_loaded_tree(&repo_id, model, ctx),
                     vec![LocalOrRemotePath::Local(
                         repo.join(".agents/skills/ignored-skill/SKILL.md")
                     )]
@@ -980,7 +923,7 @@ fn find_skill_files_in_tree_includes_ignored_skill_files() {
     });
 }
 #[test]
-fn find_skill_files_in_tree_empty_repo() {
+fn find_local_project_skill_files_in_loaded_tree_empty_repo() {
     VirtualFS::test("find_skills_empty", |dirs, mut vfs| {
         let repo = dirs.tests().join("repo");
         vfs.mkdir("repo/src");
@@ -1022,7 +965,8 @@ fn find_skill_files_in_tree_empty_repo() {
 
             model_handle.read(&app, |model, ctx| {
                 let repo_id = RepositoryIdentifier::try_local(&repo).unwrap();
-                let skill_files = find_project_skill_files_in_tree(&repo_id, model, ctx);
+                let skill_files =
+                    find_local_project_skill_files_in_loaded_tree(&repo_id, model, ctx);
                 assert!(skill_files.is_empty());
             });
         });

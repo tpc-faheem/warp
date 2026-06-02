@@ -70,18 +70,18 @@ pub(super) fn update_might_affect_project_skills(
         })
     })
 }
-/// Finds project skill files and local symlinked skill files from currently materialized metadata.
+/// Finds project skill files for locally cloned environment repositories.
 ///
-/// Local provider directories are included in the metadata query so filesystem hydration can
-/// supplement indexed files with directory symlinks. Remote repositories only return indexed
-/// skill files because their filesystems are unavailable to the client. Asynchronous project
-/// refreshes use the authoritative query path before calling this conversion logic.
-pub(super) fn find_project_skill_files_in_tree(
+/// This synchronous initialization path reads ordinary skill files from already loaded metadata,
+/// then scans local provider directories for symlinked skill directories because repository
+/// metadata intentionally omits directory symlinks. Normal project-skill refreshes use the
+/// authoritative query path instead.
+pub(super) fn find_local_project_skill_files_in_loaded_tree(
     repo_id: &RepositoryIdentifier,
     repo_metadata: &RepoMetadataModel,
     ctx: &AppContext,
 ) -> Vec<LocalOrRemotePath> {
-    let args = project_skill_query_args(repo_id);
+    let args = local_project_skill_query_args();
     let mut skill_files = Vec::new();
     let mut local_provider_directories = Vec::new();
     for content in repo_metadata
@@ -103,22 +103,19 @@ pub(super) fn find_project_skill_files_in_tree(
     add_symlinked_local_skill_files(skill_files, local_provider_directories)
 }
 
-pub(super) fn project_skill_query_args(repo_id: &RepositoryIdentifier) -> GetContentsArgs {
-    let include_local_provider_directories = matches!(repo_id, RepositoryIdentifier::Local(_));
-    let repo_id_for_filter = repo_id.clone();
+fn local_project_skill_query_args() -> GetContentsArgs {
     GetContentsArgs {
-        include_folders: include_local_provider_directories,
+        include_folders: true,
         ..GetContentsArgs::default()
     }
     .include_ignored()
     .with_filter(move |content| match content {
         RepoContent::File(file) => {
-            let path = local_or_remote_path_for_repo_path(&repo_id_for_filter, &file.path);
+            let path = LocalOrRemotePath::Local(file.path.to_local_path_lossy());
             extract_skill_parent_directory(&path).is_ok()
         }
         RepoContent::Directory(directory) => {
-            include_local_provider_directories
-                && is_project_provider_path(&directory.path.to_local_path_lossy())
+            is_project_provider_path(&directory.path.to_local_path_lossy())
         }
     })
 }
@@ -174,7 +171,7 @@ fn add_symlinked_local_skill_files(
 /// Reads local project skills by discovering provider directories on the filesystem.
 ///
 /// This is a local-only fallback for repositories whose repo metadata indexing fails. Successful
-/// local and remote project refreshes should use [`find_project_skill_files_in_tree`] so the
+/// local and remote project refreshes should use [`find_project_skill_files_in_contents`] so the
 /// normal metadata-backed path remains shared.
 pub(super) fn read_local_project_skills_from_filesystem(scan_root: &Path) -> Vec<ParsedSkill> {
     let direct_skill_file = scan_root.join("SKILL.md");
