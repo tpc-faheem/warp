@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use ai::skills::{
     get_provider_for_path, home_skills_path, parse_skill, parse_skill_content_at_location,
@@ -48,7 +47,6 @@ pub enum SkillWatcherEvent {
 
 const REMOTE_SKILL_MAX_FILE_BYTES: u32 = 1024 * 1024;
 const REMOTE_SKILL_MAX_BATCH_BYTES: u32 = 5 * 1024 * 1024;
-const PROJECT_SKILL_MAX_ENTRIES_SCANNED: usize = 100_000;
 type ProjectSkillContentsFuture =
     BoxFuture<'static, anyhow::Result<Vec<(LocalOrRemotePath, String)>>>;
 pub struct SkillWatcher {
@@ -251,9 +249,7 @@ impl SkillWatcher {
         let query = RepoMetadataModel::as_ref(ctx).get_repo_contents(
             repo_id.clone(),
             project_skill_query(),
-            RepoContentsQueryBudget {
-                max_entries_scanned: PROJECT_SKILL_MAX_ENTRIES_SCANNED,
-            },
+            RepoContentsQueryBudget::default(),
             remote_query_provider,
             ctx,
         );
@@ -1103,8 +1099,7 @@ fn remote_project_metadata_query_provider(
         .client_for_host(&remote_id.host_id)?
         .clone();
 
-    Some(Arc::new(move |remote_id, query, budget| {
-        let client = client.clone();
+    Some(Box::new(move |remote_id, query, budget| {
         async move {
             let response = client
                 .query_repo_metadata(

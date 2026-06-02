@@ -7,7 +7,6 @@
 
 #[cfg(feature = "local_fs")]
 use std::path::Path;
-use std::sync::Arc;
 
 use futures::future::{self, BoxFuture, FutureExt as _};
 use serde::{Deserialize, Serialize};
@@ -26,6 +25,9 @@ use crate::remote_model::{RemoteRepoMetadataModel, RemoteRepositoryMetadataEvent
 use crate::repository_identifier::{RemoteRepositoryIdentifier, RepositoryIdentifier};
 use crate::RepoMetadataError;
 
+/// Default maximum file-system traversal work permitted by an authoritative contents query.
+const DEFAULT_AUTHORITATIVE_QUERY_MAX_ENTRIES_SCANNED: usize = 100_000;
+
 /// Maximum file-system traversal work permitted by an authoritative contents query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoContentsQueryBudget {
@@ -35,7 +37,7 @@ pub struct RepoContentsQueryBudget {
 impl Default for RepoContentsQueryBudget {
     fn default() -> Self {
         Self {
-            max_entries_scanned: 100_000,
+            max_entries_scanned: DEFAULT_AUTHORITATIVE_QUERY_MAX_ENTRIES_SCANNED,
         }
     }
 }
@@ -78,14 +80,13 @@ pub enum RepoContentsQueryError {
 /// `repo_metadata` owns query semantics; app-layer consumers supply a provider backed by the
 /// connected remote-server client without introducing a reverse crate dependency. Returned
 /// query matches are discovery output and do not mutate the canonical metadata tree.
-pub type RemoteMetadataQueryProvider = Arc<
-    dyn Fn(
+pub type RemoteMetadataQueryProvider = Box<
+    dyn FnOnce(
             RemoteRepositoryIdentifier,
             RepoMetadataQuery,
             RepoContentsQueryBudget,
         ) -> BoxFuture<'static, Result<Vec<OwnedRepoContent>, RepoContentsQueryError>>
-        + Send
-        + Sync,
+        + Send,
 >;
 
 /// Unified events emitted by the [`RepoMetadataModel`] wrapper.

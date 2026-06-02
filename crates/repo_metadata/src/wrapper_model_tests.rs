@@ -172,7 +172,7 @@ fn authoritative_remote_query_returns_matches_without_materializing_tree() {
 
         let expected_remote_id = remote_id.clone();
         let match_path_for_provider = match_path.clone();
-        let provider: RemoteMetadataQueryProvider = Arc::new(move |requested_id, query, _| {
+        let provider: RemoteMetadataQueryProvider = Box::new(move |requested_id, query, _| {
             assert_eq!(requested_id, expected_remote_id);
             assert_eq!(
                 query,
@@ -241,7 +241,7 @@ fn fully_loaded_remote_query_uses_loaded_tree_without_remote_provider() {
 
         let called = Arc::new(AtomicBool::new(false));
         let called_for_provider = called.clone();
-        let provider: RemoteMetadataQueryProvider = Arc::new(move |_, _, _| {
+        let provider: RemoteMetadataQueryProvider = Box::new(move |_, _, _| {
             called_for_provider.store(true, Ordering::SeqCst);
             async move { Ok(Vec::new()) }.boxed()
         });
