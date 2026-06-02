@@ -280,11 +280,7 @@ fn fully_loaded_remote_query_propagates_loaded_result_limit_failure() {
                 file(StandardizedPath::try_new(&path).unwrap())
             })
             .collect();
-        let state = FileTreeState::new(
-            directory(repo_path, true, children),
-            Vec::new(),
-            None,
-        );
+        let state = FileTreeState::new(directory(repo_path, true, children), Vec::new(), None);
         model.update(&mut app, |model, ctx| {
             model.remote.update(ctx, |remote, _| {
                 remote.insert_test_state(remote_id, state);

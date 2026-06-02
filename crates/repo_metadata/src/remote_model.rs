@@ -262,7 +262,10 @@ impl RemoteRepoMetadataModel {
                 entry_update.subtree_metadata.clone(),
             );
         }
-        ctx.emit(RemoteRepositoryMetadataEvent::FileTreeEntryUpdated { id });
+        ctx.emit(RemoteRepositoryMetadataEvent::FileTreeEntryUpdated {
+            id,
+            update_type: MetadataUpdateType::FullReplace,
+        });
     }
 }
 

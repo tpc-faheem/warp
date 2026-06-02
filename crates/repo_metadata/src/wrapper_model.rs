@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 use warp_core::HostId;
 use warp_util::standardized_path::StandardizedPath;
 use warpui_core::{AppContext, ModelContext, ModelHandle, SingletonEntity};
+
 use crate::file_tree_store::{FileTreeEntry, FileTreeEntryState, FileTreeState};
 use crate::file_tree_update::{MetadataUpdateType, RepoMetadataUpdate};
 use crate::local_model::{
