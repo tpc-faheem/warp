@@ -679,6 +679,11 @@ default = [
     "billing_and_usage_page_v2",
     "remote_code_review",
     "git_operations_in_code_review",
+    # Chrome-style tab tear-off: drag a tab out of its window to spawn a new
+    # window (and grouped-tab dragging). Implemented upstream but gated behind
+    # the DOGFOOD flag; enabled here by default for the local OSS build.
+    "drag_tabs_to_windows",
+    "grouped_tabs",
 ]
 # Enable this feature to automatically perform heap profiling.  NOTE: This will
 # substantially slow down program execution.
