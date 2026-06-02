@@ -431,6 +431,9 @@ pub mod text {
                     AIAgentActionType::AskUserQuestion { .. } => (),
                     // RunAgents is desktop-client-only; SDK driver renders nothing.
                     AIAgentActionType::RunAgents(_) => (),
+                    // QUALITY-780 §10: the synthetic wait action has no
+                    // user-visible output in the SDK driver.
+                    AIAgentActionType::WaitForEvents { .. } => (),
                 },
                 AIAgentOutputMessageType::TodoOperation(operation) => match operation {
                     TodoOperation::UpdateTodos { todos } => {
@@ -1112,6 +1115,9 @@ pub mod json {
                     // RunAgents is desktop-client-only; SDK has no JSON
                     // representation for it.
                     AIAgentActionType::RunAgents(_) => None,
+                    // QUALITY-780 §10: the synthetic wait action has no
+                    // user-visible JSON representation in the SDK driver.
+                    AIAgentActionType::WaitForEvents { .. } => None,
                 },
                 AIAgentOutputMessageType::TodoOperation(operation) => match operation {
                     TodoOperation::UpdateTodos { todos } => Some(JsonMessage::UpdateTodos {

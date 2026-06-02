@@ -872,13 +872,21 @@ impl ConvertAPIToolCallToAIAgentAction for api::message::ToolCall {
             api::message::tool_call::Tool::Server(_) => {
                 Ok(MaybeAIAgentAction::NoClientRepresentation)
             }
-            // QUALITY-780: `wait_for_events` is a yield signal handled
-            // specially in `BlocklistAIHistoryModel::apply_client_actions`
-            // (see client TECH §8.1), which transitions the conversation
-            // to `WaitingForEvents` rather than producing an action result.
-            // No `AIAgentAction` representation is needed here.
-            api::message::tool_call::Tool::WaitForEvents(_) => {
-                Ok(MaybeAIAgentAction::NoClientRepresentation)
+            // QUALITY-780 §10: `wait_for_events` is now a first-class
+            // `action_model` action. Producing a real `AIAgentAction`
+            // here ensures the action ends up in the exchange's
+            // `output.actions()` so `AIConversation::mark_request_completed`
+            // sees `has_new_actions = true` and does not transition the
+            // conversation to `Success` on the yield stream. The action
+            // is later picked up by `queue_actions` from the response
+            // stream's `AfterStreamFinished` handler and dispatched to
+            // the `WaitForEventsExecutor`, which schedules the watchdog
+            // and transitions the conversation to `WaitingForEvents`.
+            api::message::tool_call::Tool::WaitForEvents(payload) => {
+                create_standard_action(AIAgentActionType::WaitForEvents {
+                    tool_call_id: self.tool_call_id.clone(),
+                    idle_timeout_seconds: payload.idle_timeout_seconds,
+                })
             }
             _ => Err(ToolToAIAgentActionError::UnexpectedTool),
         }

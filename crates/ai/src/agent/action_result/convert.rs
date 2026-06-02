@@ -1455,16 +1455,21 @@ impl TryFrom<InsertReviewCommentsResult> for api::request::input::tool_call_resu
 impl TryFrom<WaitForEventsResult> for api::request::input::tool_call_result::Result {
     type Error = ConvertToAPITypeError;
 
-    /// QUALITY-780: emit the wire form of the watchdog-timeout result so
+    /// QUALITY-780: emit the wire form of the watchdog-completion result so
     /// the server receives the empty `WaitForEventsResult` and echoes it
     /// back through the normal stream. The agent's next turn observes
-    /// the empty result and decides how to proceed.
-    fn try_from(_result: WaitForEventsResult) -> Result<Self, Self::Error> {
-        Ok(
-            api::request::input::tool_call_result::Result::WaitForEvents(
-                api::WaitForEventsResult {},
+    /// the empty result and decides how to proceed. The `Cancelled`
+    /// variant maps to `Ignore` so user-cancellation does not produce a
+    /// stray tool-call result on the wire (mirrors `RunAgents::Cancelled`).
+    fn try_from(result: WaitForEventsResult) -> Result<Self, Self::Error> {
+        match result {
+            WaitForEventsResult::Completed => Ok(
+                api::request::input::tool_call_result::Result::WaitForEvents(
+                    api::WaitForEventsResult {},
+                ),
             ),
-        )
+            WaitForEventsResult::Cancelled => Err(ConvertToAPITypeError::Ignore),
+        }
     }
 }
 

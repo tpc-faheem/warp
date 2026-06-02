@@ -320,6 +320,16 @@ impl From<&AIAgentActionType> for PersistedAIAgentActionType {
             // Orchestrate is rendered from the in-history tool call message;
             // there is no per-action state we need to persist locally.
             AIAgentActionType::RunAgents(_) => Self::NotPersisted,
+            // QUALITY-780 §10: the wait action is synthesized at
+            // runtime from the `WaitForEvents` tool call in the
+            // transcript; the executor's in-memory state (pending
+            // entry, watchdog timer) is intentionally not persisted.
+            // On restart, restored conversations whose status was
+            // `WaitingForEvents` rebuild via the durable
+            // `AgentConversationData.waiting_for_events` flag and the
+            // transcript-scan fallback in
+            // `clear_conversation_waiting_for_events_if_matches`.
+            AIAgentActionType::WaitForEvents { .. } => Self::NotPersisted,
         }
     }
 }

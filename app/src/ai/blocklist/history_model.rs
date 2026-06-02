@@ -1549,18 +1549,16 @@ impl BlocklistAIHistoryModel {
                     current_conversation_id = new_conversation_id;
                 }
                 Some(Action::AddMessagesToTask(action)) => {
-                    // QUALITY-780 §8.1: detect the new public `WaitForEvents`
-                    // tool call (enter the waiting state) and §8.3: detect the
-                    // matching resume signals (`WaitForEventsResult` for the
-                    // watchdog-timeout path; generic `Cancel` for the
-                    // inbound-supersede path). Both leave the conversation in
-                    // `InProgress`. Detection runs **before** the call is
-                    // dispatched to `conversation.apply_client_action`, so the
-                    // status change is in place before any downstream subscriber
-                    // (driver, task-sync, pill-bar, notifications) observes the
-                    // message batch — see §8.2 for the ordering rule that
-                    // protects this transition from being clobbered by the
-                    // subsequent `Success` transition on the response stream.
+                    // QUALITY-780 §10: detect inbound resume signals
+                    // (`WaitForEventsResult` echoed back by the server
+                    // and generic `Cancel` referencing the unresolved
+                    // tool-call id) so the action_model can close out
+                    // the running `WaitForEvents` action. The entry
+                    // path (`Tool::WaitForEvents` arriving for the first
+                    // time) is no longer handled here — the action is
+                    // synthesized in `convert_from.rs` and dispatched
+                    // through the normal `queue_actions` path on
+                    // `AfterStreamFinished`.
                     self.detect_wait_for_events_transitions(
                         current_conversation_id,
                         terminal_view_id,
@@ -1602,11 +1600,22 @@ impl BlocklistAIHistoryModel {
         Ok(())
     }
 
-    /// QUALITY-780 §8.1 / §8.3: scans the messages in an
-    /// `AddMessagesToTask` action for `WaitForEvents` tool calls (enter the
-    /// waiting state) or matching resume signals (`WaitForEventsResult` or a
-    /// generic `Cancel` referencing the unresolved tool-call id), and updates
-    /// the conversation accordingly.
+    /// QUALITY-780 §10: scan messages in an `AddMessagesToTask` for
+    /// inbound resume signals (`WaitForEventsResult` echoed back by the
+    /// server after the client watchdog fired; generic `Cancel`
+    /// referencing the unresolved tool-call id when an inbound user
+    /// message / inter-agent message / lifecycle event supersedes the
+    /// pending wait) and transition the conversation out of
+    /// `WaitingForEvents`. The status flip emits an
+    /// `UpdatedConversationStatus` event; the `WaitForEventsExecutor`
+    /// subscribes to this event and drives the running wait action to
+    /// completion via the action_model.
+    ///
+    /// The entry half (a fresh `Tool::WaitForEvents` arriving for the
+    /// first time) is **not** handled here — `convert_from.rs`
+    /// synthesizes an `AIAgentAction` for that variant, which lands in
+    /// the exchange's `output.actions()` and is then dispatched through
+    /// the normal `queue_actions` path on `AfterStreamFinished`.
     fn detect_wait_for_events_transitions(
         &mut self,
         conversation_id: AIConversationId,
@@ -1615,54 +1624,32 @@ impl BlocklistAIHistoryModel {
         ctx: &mut ModelContext<Self>,
     ) {
         for message in &action.messages {
-            match message.message.as_ref() {
-                Some(api::message::Message::ToolCall(tool_call)) => {
-                    if matches!(
-                        tool_call.tool.as_ref(),
-                        Some(api::message::tool_call::Tool::WaitForEvents(_))
-                    ) {
-                        self.mark_conversation_waiting_for_events(
-                            conversation_id,
-                            tool_call.tool_call_id.clone(),
-                            terminal_view_id,
-                            ctx,
-                        );
-                    }
-                }
-                Some(api::message::Message::ToolCallResult(result)) => {
-                    match result.result.as_ref() {
-                        // The client watchdog (§4) emitted a synthetic
-                        // `WaitForEventsResult` that the server has echoed
-                        // back — the agent's next turn will observe the
-                        // empty timeout result.
-                        Some(api::message::tool_call_result::Result::WaitForEvents(_)) => {
-                            self.clear_conversation_waiting_for_events_if_matches(
-                                conversation_id,
-                                &result.tool_call_id,
-                                terminal_view_id,
-                                ctx,
-                            );
-                        }
-                        // An inbound user message / inter-agent message /
-                        // lifecycle event superseded the pending
-                        // `WaitForEvents` call; the server emitted a generic
-                        // `Cancel` tool-call result referencing that id.
-                        // Only clear when the stored id matches — unrelated
-                        // tool cancellations must not collapse the waiting
-                        // state.
-                        Some(api::message::tool_call_result::Result::Cancel(_)) => {
-                            self.clear_conversation_waiting_for_events_if_matches(
-                                conversation_id,
-                                &result.tool_call_id,
-                                terminal_view_id,
-                                ctx,
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
+            let Some(api::message::Message::ToolCallResult(result)) = message.message.as_ref()
+            else {
+                continue;
+            };
+            let resume_signal = match result.result.as_ref() {
+                // The client watchdog (§4 / §10) emitted a synthetic
+                // `WaitForEventsResult` that the server has echoed back
+                // — the agent's next turn will observe the empty
+                // timeout result.
+                Some(api::message::tool_call_result::Result::WaitForEvents(_)) => true,
+                // An inbound user message / inter-agent message /
+                // lifecycle event superseded the pending `WaitForEvents`
+                // call; the server emitted a generic `Cancel` tool-call
+                // result referencing that id.
+                Some(api::message::tool_call_result::Result::Cancel(_)) => true,
+                _ => false,
+            };
+            if !resume_signal {
+                continue;
             }
+            self.clear_conversation_waiting_for_events_if_matches(
+                conversation_id,
+                &result.tool_call_id,
+                terminal_view_id,
+                ctx,
+            );
         }
     }
 

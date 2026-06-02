@@ -818,11 +818,12 @@ impl AIAgentActionResultType {
             ) => true,
             Self::AskUserQuestion(AskUserQuestionResult::Success { .. }) => true,
             Self::RunAgents(RunAgentsResult::Launched { .. }) => true,
-            // QUALITY-780: the watchdog-timeout result is a successful
+            // QUALITY-780: the `Completed` variant is a successful
             // tool-call completion from the conversation's perspective —
             // there is no error to surface and the agent will decide how
-            // to proceed on its next turn.
-            Self::WaitForEvents(_) => true,
+            // to proceed on its next turn. The `Cancelled` variant maps
+            // to the user-cancellation path via `is_cancelled()` below.
+            Self::WaitForEvents(WaitForEventsResult::Completed) => true,
             _ => false,
         }
     }
@@ -897,7 +898,11 @@ impl AIAgentActionResultType {
             | Self::SendMessageToAgent(SendMessageToAgentResult::Cancelled)
             // SkippedByAutoApprove is intentionally excluded: the agent should continue.
             | Self::AskUserQuestion(AskUserQuestionResult::Cancelled)
-            | Self::RunAgents(RunAgentsResult::Cancelled) => true,
+            | Self::RunAgents(RunAgentsResult::Cancelled)
+            // QUALITY-780: user-cancellation while waiting maps to the
+            // standard cancellation path so the conversation transitions
+            // to `ConversationStatus::Cancelled`.
+            | Self::WaitForEvents(WaitForEventsResult::Cancelled) => true,
             _ => false,
         }
     }
@@ -1472,18 +1477,33 @@ impl Display for AskUserQuestionResult {
     }
 }
 
-/// QUALITY-780: result emitted by the client's `wait_for_events` watchdog
-/// when it fires before an inbound resume input arrives. The proto wire
-/// form (`Message::ToolCallResult.WaitForEvents`) carries no payload — the
-/// variant identity is the entire signal. The agent's next turn observes
-/// this empty result and decides how to proceed (commonly `finish_task`,
-/// but the agent may also re-yield or ask the user). See
-/// `specs/QUALITY-780/TECH.md` §4 / §8.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WaitForEventsResult;
+/// QUALITY-780: result of the client's `wait_for_events` action. Drives
+/// the action's `handle_action_result` path. See
+/// `specs/QUALITY-780/TECH.md` §4 / §8 / §10.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WaitForEventsResult {
+    /// The wait completed normally — either the client watchdog fired
+    /// before an inbound resume arrived, or an inbound resume signal
+    /// (e.g. a generic `Cancel` for the wait's tool-call id) concluded
+    /// the wait. The agent's next turn sees the empty result and
+    /// decides how to proceed (commonly `finish_task`, but the agent
+    /// may also re-yield, ask the user, or take other action). The
+    /// proto wire form (`Message::ToolCallResult.WaitForEvents`) is
+    /// emitted for this variant.
+    Completed,
+    /// The user explicitly cancelled the conversation while it was
+    /// waiting. The action is removed from `running_actions` with a
+    /// cancellation marker so the conversation transitions to
+    /// `ConversationStatus::Cancelled`; no tool-call result is sent on
+    /// the wire (mirrors the `RunAgents::Cancelled` shape).
+    Cancelled,
+}
 
 impl Display for WaitForEventsResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Wait for events timed out")
+        match self {
+            Self::Completed => write!(f, "Wait for events completed"),
+            Self::Cancelled => write!(f, "Wait for events cancelled"),
+        }
     }
 }

@@ -172,6 +172,35 @@ pub enum AIAgentActionType {
     /// `base_prompt + "\n\n" + agent_run_configs[i].prompt` (or just
     /// `base_prompt` when the per-agent `prompt` is empty).
     RunAgents(RunAgentsRequest),
+
+    /// QUALITY-780 §10: synthesized internally by
+    /// `BlocklistAIHistoryModel::detect_wait_for_events_transitions`
+    /// when an inbound `Message::ToolCall::WaitForEvents` is seen. This
+    /// action is **not** produced by the standard
+    /// `ConvertAPIToolCallToAIAgentAction` path — the public tool call
+    /// is detected separately and an action variant is enqueued on the
+    /// action model so the wait runs through the executor lifecycle.
+    /// The executor schedules a watchdog, drives the conversation into
+    /// `ConversationStatus::WaitingForEvents`, and — on watchdog fire
+    /// or inbound resume — completes the action with a
+    /// `AIAgentActionResultType::WaitForEvents` result that triggers the
+    /// controller's auto-follow-up subscriber. See
+    /// `specs/QUALITY-780/TECH.md` §10.
+    WaitForEvents {
+        /// The `tool_call_id` of the unresolved server-emitted
+        /// `Message::ToolCall::WaitForEvents` that this action is
+        /// closing out. Used by the executor to match inbound resume
+        /// signals (generic `Cancel`, server-echoed
+        /// `WaitForEventsResult`) against the in-flight wait.
+        tool_call_id: String,
+        /// Server-supplied `idle_timeout_seconds` from the public
+        /// `WaitForEvents` proto payload. Treated as "unset" when `0`
+        /// per the prost convention for flat scalars; the executor
+        /// falls back to a built-in default in that case. The executor
+        /// further subtracts a client-side safety margin so the
+        /// watchdog fires before the worker-side idle-shutdown.
+        idle_timeout_seconds: i32,
+    },
 }
 
 /// Run-wide + per-agent configuration for a `RunAgents` tool call.
@@ -382,6 +411,16 @@ impl AIAgentActionType {
                 AIAgentActionResultType::AskUserQuestion(AskUserQuestionResult::Cancelled)
             }
             Self::RunAgents(_) => AIAgentActionResultType::RunAgents(RunAgentsResult::Cancelled),
+            // QUALITY-780 §10: the user explicitly cancelled the
+            // conversation while it was waiting. The `Cancelled` result
+            // is treated as `is_cancelled() == true` so the conversation
+            // transitions to `ConversationStatus::Cancelled`. The
+            // outbound proto conversion drops the result (mirrors
+            // `RunAgents::Cancelled`), so the server does not see a
+            // tool-call result for the user-cancellation path.
+            Self::WaitForEvents { .. } => AIAgentActionResultType::WaitForEvents(
+                crate::agent::action_result::WaitForEventsResult::Cancelled,
+            ),
         }
     }
 
@@ -430,6 +469,7 @@ impl AIAgentActionType {
             Self::RunAgents(req) => {
                 format!("Orchestrate {} agent(s)", req.agent_run_configs.len())
             }
+            Self::WaitForEvents { .. } => "Wait for events".to_string(),
         }
     }
 }
@@ -610,6 +650,15 @@ impl Display for AIAgentActionType {
                     .collect::<Vec<_>>()
                     .join(", ");
                 write!(f, "Orchestrate: summary='{}' agents=[{names}]", req.summary,)
+            }
+            AIAgentActionType::WaitForEvents {
+                tool_call_id,
+                idle_timeout_seconds,
+            } => {
+                write!(
+                    f,
+                    "WaitForEvents: tool_call_id={tool_call_id} idle_timeout_seconds={idle_timeout_seconds}"
+                )
             }
         }
     }

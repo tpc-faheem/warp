@@ -381,7 +381,10 @@ fn extract_action_paths(
         | AIAgentActionType::SendMessageToAgent { .. }
         | AIAgentActionType::TransferShellCommandControlToUser { .. }
         | AIAgentActionType::AskUserQuestion { .. }
-        | AIAgentActionType::RunAgents(_) => {}
+        | AIAgentActionType::RunAgents(_)
+        // QUALITY-780 §10: the synthetic `WaitForEvents` action carries
+        // no filesystem context; nothing to extract.
+        | AIAgentActionType::WaitForEvents { .. } => {}
     }
 }
 
