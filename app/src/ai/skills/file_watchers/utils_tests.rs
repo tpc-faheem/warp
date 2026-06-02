@@ -7,7 +7,7 @@ use repo_metadata::file_tree_update::{
 };
 use repo_metadata::repositories::DetectedRepositories;
 use repo_metadata::{
-    DirectoryWatcher, RepoMetadataModel, RepoMetadataUpdate, RepositoryIdentifier,
+    DirectoryWatcher, OwnedRepoContent, RepoMetadataModel, RepoMetadataUpdate, RepositoryIdentifier,
 };
 use virtual_fs::{Stub, VirtualFS};
 use warp_core::HostId;
@@ -18,8 +18,8 @@ use warpui::App;
 
 use super::{
     extract_skill_parent_directory, find_local_project_skill_files_in_loaded_tree,
-    is_home_provider_path, is_home_skill_directory, is_skill_file, read_skills_from_files,
-    update_might_affect_project_skills,
+    find_project_skill_files_in_contents, is_home_provider_path, is_home_skill_directory,
+    is_skill_file, read_skills_from_files, update_might_affect_project_skills,
 };
 
 // ============================================================================
@@ -656,7 +656,7 @@ fn update_relevance_detects_removal_of_known_skill_ancestor() {
 }
 
 #[test]
-fn update_relevance_filters_remote_updates_by_skill_file_paths() {
+fn update_relevance_detects_remote_skill_and_provider_directory_updates() {
     let host_id = HostId::new("test-host".to_string());
     let repo_path = StandardizedPath::try_new("/repo").unwrap();
     let repo_id = RepositoryIdentifier::Remote(RemotePath::new(host_id, repo_path.clone()));
@@ -673,7 +673,7 @@ fn update_relevance_filters_remote_updates_by_skill_file_paths() {
         }],
     };
     let skill_update = RepoMetadataUpdate {
-        repo_path,
+        repo_path: repo_path.clone(),
         remove_entries: Vec::new(),
         update_entries: vec![FileTreeEntryUpdate {
             parent_path_to_replace: StandardizedPath::try_new("/repo/.claude/skills/review")
@@ -682,6 +682,18 @@ fn update_relevance_filters_remote_updates_by_skill_file_paths() {
                 path: StandardizedPath::try_new("/repo/.claude/skills/review/SKILL.md").unwrap(),
                 extension: Some("md".to_string()),
                 ignored: false,
+            })],
+        }],
+    };
+    let provider_update = RepoMetadataUpdate {
+        repo_path,
+        remove_entries: Vec::new(),
+        update_entries: vec![FileTreeEntryUpdate {
+            parent_path_to_replace: StandardizedPath::try_new("/repo").unwrap(),
+            subtree_metadata: vec![RepoNodeMetadata::Directory(DirectoryNodeMetadata {
+                path: StandardizedPath::try_new("/repo/.agents/skills").unwrap(),
+                ignored: false,
+                loaded: true,
             })],
         }],
     };
@@ -694,6 +706,11 @@ fn update_relevance_filters_remote_updates_by_skill_file_paths() {
     assert!(update_might_affect_project_skills(
         &repo_id,
         &skill_update,
+        None
+    ));
+    assert!(update_might_affect_project_skills(
+        &repo_id,
+        &provider_update,
         None
     ));
 }
@@ -850,6 +867,30 @@ fn find_local_project_skill_files_in_loaded_tree_finds_subdirectory_skills() {
             });
         });
     });
+}
+
+#[test]
+fn authoritative_project_skill_contents_preserve_remote_symlink_paths() {
+    let host_id = HostId::new("test-host".to_string());
+    let repo_path = StandardizedPath::try_new("/repo").unwrap();
+    let symlink_skill_path =
+        StandardizedPath::try_new("/repo/.agents/skills/linked/SKILL.md").unwrap();
+    let repo_id = RepositoryIdentifier::Remote(RemotePath::new(host_id.clone(), repo_path.clone()));
+
+    assert_eq!(
+        find_project_skill_files_in_contents(
+            &repo_id,
+            vec![OwnedRepoContent::File {
+                path: symlink_skill_path.clone(),
+                extension: Some("md".to_string()),
+                ignored: false,
+            }],
+        ),
+        vec![LocalOrRemotePath::Remote(RemotePath::new(
+            host_id,
+            symlink_skill_path
+        ))]
+    );
 }
 
 #[test]

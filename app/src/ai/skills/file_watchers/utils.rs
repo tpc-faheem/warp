@@ -34,8 +34,8 @@ fn local_or_remote_path_for_repo_path(
 
 /// Returns whether an incremental metadata update can alter project skills for a repository.
 ///
-/// Local provider-directory changes are included because symlinked skill directories are
-/// hydrated from the local filesystem rather than represented directly in repo metadata.
+/// Provider-directory changes are included because authoritative project-skill discovery runs
+/// on the host that owns the repository and can surface symlinked skills absent from metadata.
 pub(super) fn update_might_affect_project_skills(
     repo_id: &RepositoryIdentifier,
     update: &RepoMetadataUpdate,
@@ -51,11 +51,8 @@ pub(super) fn update_might_affect_project_skills(
         return true;
     }
 
-    let is_local_repo = matches!(repo_id, RepositoryIdentifier::Local(_));
     update.update_entries.iter().any(|entry_update| {
-        if is_local_repo
-            && is_project_provider_path(&entry_update.parent_path_to_replace.to_local_path_lossy())
-        {
+        if is_project_provider_path(&entry_update.parent_path_to_replace.to_local_path_lossy()) {
             return true;
         }
 
@@ -65,7 +62,7 @@ pub(super) fn update_might_affect_project_skills(
                 extract_skill_parent_directory(&path).is_ok()
             }
             RepoNodeMetadata::Directory(directory) => {
-                is_local_repo && is_project_provider_path(&directory.path.to_local_path_lossy())
+                is_project_provider_path(&directory.path.to_local_path_lossy())
             }
         })
     })
@@ -139,21 +136,15 @@ pub(super) fn find_project_skill_files_in_contents(
     repo_id: &RepositoryIdentifier,
     contents: Vec<OwnedRepoContent>,
 ) -> Vec<LocalOrRemotePath> {
-    let mut skill_files = Vec::new();
-    let mut local_provider_directories = Vec::new();
-    for content in contents {
-        match content {
+    contents
+        .into_iter()
+        .filter_map(|content| match content {
             OwnedRepoContent::File { path, .. } => {
-                skill_files.push(local_or_remote_path_for_repo_path(repo_id, &path));
+                Some(local_or_remote_path_for_repo_path(repo_id, &path))
             }
-            OwnedRepoContent::Directory { path, .. } => {
-                if let Some(path) = path.to_local_path() {
-                    local_provider_directories.push(path);
-                }
-            }
-        }
-    }
-    add_symlinked_local_skill_files(skill_files, local_provider_directories)
+            OwnedRepoContent::Directory { .. } => None,
+        })
+        .collect()
 }
 
 fn add_symlinked_local_skill_files(
@@ -172,7 +163,7 @@ fn add_symlinked_local_skill_files(
 ///
 /// This is a local-only fallback for repositories whose repo metadata indexing fails. Successful
 /// local and remote project refreshes should use [`find_project_skill_files_in_contents`] so the
-/// normal metadata-backed path remains shared.
+/// normal authoritative metadata-query path remains shared.
 pub(super) fn read_local_project_skills_from_filesystem(scan_root: &Path) -> Vec<ParsedSkill> {
     let direct_skill_file = scan_root.join("SKILL.md");
     if is_skill_file(&direct_skill_file) {
@@ -211,8 +202,8 @@ fn is_ignored_fallback_scan_entry(entry: &DirEntry) -> bool {
 /// Finds symlinked skill directories under loaded local provider directories in a repository.
 ///
 /// Repo metadata intentionally skips directory symlinks to avoid duplicate trees/cycles. Project
-/// skill refreshes are still triggered by repo metadata, but local hydration supplements the tree
-/// with `SKILL.md` files from symlinked skill directories so existing symlink handling is preserved.
+/// skill initialization for local cloned environments supplements the loaded tree with `SKILL.md`
+/// files from symlinked directories; normal refreshes use authoritative host-side discovery.
 fn find_symlinked_skill_files_in_local_provider_directories(
     provider_dirs: Vec<PathBuf>,
 ) -> Vec<PathBuf> {

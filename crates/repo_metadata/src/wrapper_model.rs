@@ -46,8 +46,8 @@ impl Default for RepoContentsQueryBudget {
 /// Serializable descriptions of authoritative metadata discovery requests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepoMetadataQuery {
-    /// Finds `SKILL.md` files below registered provider roots and returns provider directories
-    /// as well so local callers can supplement indexed paths with symlinked skill directories.
+    /// Finds `SKILL.md` files below registered provider roots, including skill directories
+    /// reached through immediate child symlinks of a provider directory.
     ProjectSkillFiles { provider_paths: Vec<String> },
     /// Finds files whose basename equals one of the requested names.
     FilesNamed { names: Vec<String> },
@@ -257,10 +257,10 @@ impl RepoMetadataModel {
 
     /// Returns authoritative repository contents for a typed query.
     ///
-    /// A fully loaded canonical tree is used as an I/O-free fast path. Otherwise, local queries
-    /// scan the repository with a work budget and remote queries are delegated through an
-    /// app-provided query provider. Match-only authoritative results never modify canonical tree
-    /// children.
+    /// A fully loaded canonical tree is used as an I/O-free fast path for queries completely
+    /// represented in that tree. `ProjectSkillFiles` always runs on the repository host because
+    /// directory symlinks are intentionally absent from canonical trees. Match-only authoritative
+    /// results never modify canonical tree children.
     pub fn get_repo_contents(
         &self,
         id: RepositoryIdentifier,
@@ -269,15 +269,15 @@ impl RepoMetadataModel {
         remote_query_provider: Option<RemoteMetadataQueryProvider>,
         ctx: &AppContext,
     ) -> BoxFuture<'static, Result<Vec<OwnedRepoContent>, RepoContentsQueryError>> {
-        let loaded_contents = match self.loaded_query_contents(&id, &query, ctx) {
-            Ok(contents) => contents,
-            Err(error) => return future::ready(Err(error)).boxed(),
-        };
-        if self
-            .get_repository(&id, ctx)
-            .is_some_and(|state| tree_is_fully_loaded(&state.entry, state.entry.root_directory()))
+        if let Err(error) = self.ensure_repository_queryable(&id, ctx) {
+            return future::ready(Err(error)).boxed();
+        }
+        if !matches!(&query, RepoMetadataQuery::ProjectSkillFiles { .. })
+            && self.get_repository(&id, ctx).is_some_and(|state| {
+                tree_is_fully_loaded(&state.entry, state.entry.root_directory())
+            })
         {
-            return future::ready(Ok(loaded_contents)).boxed();
+            return future::ready(self.loaded_query_contents(&id, &query, ctx)).boxed();
         }
         match id {
             RepositoryIdentifier::Local(repo_root) => {
@@ -299,19 +299,6 @@ impl RepoMetadataModel {
         query: &RepoMetadataQuery,
         ctx: &AppContext,
     ) -> Result<Vec<OwnedRepoContent>, RepoContentsQueryError> {
-        match self.repository_state(id, ctx) {
-            Some(IndexedRepoState::Indexed(_)) => {}
-            Some(IndexedRepoState::Pending(_)) => {
-                return Err(RepoContentsQueryError::RepositoryPending(id.clone()));
-            }
-            Some(IndexedRepoState::Failed(error)) => {
-                return Err(RepoContentsQueryError::RepositoryIndexingFailed {
-                    id: id.clone(),
-                    message: error.to_string(),
-                });
-            }
-            None => return Err(RepoContentsQueryError::RepositoryNotFound(id.clone())),
-        }
         Ok(self
             .get_loaded_repo_contents(id, get_loaded_query_args(query.clone()), ctx)
             .map_err(|error| RepoContentsQueryError::QueryFailed {
@@ -320,6 +307,26 @@ impl RepoMetadataModel {
             .iter()
             .map(RepoContent::to_owned)
             .collect())
+    }
+
+    fn ensure_repository_queryable(
+        &self,
+        id: &RepositoryIdentifier,
+        ctx: &AppContext,
+    ) -> Result<(), RepoContentsQueryError> {
+        match self.repository_state(id, ctx) {
+            Some(IndexedRepoState::Indexed(_)) => Ok(()),
+            Some(IndexedRepoState::Pending(_)) => {
+                Err(RepoContentsQueryError::RepositoryPending(id.clone()))
+            }
+            Some(IndexedRepoState::Failed(error)) => {
+                Err(RepoContentsQueryError::RepositoryIndexingFailed {
+                    id: id.clone(),
+                    message: error.to_string(),
+                })
+            }
+            None => Err(RepoContentsQueryError::RepositoryNotFound(id.clone())),
+        }
     }
 
     /// Returns whether the given repository is indexed.
@@ -646,6 +653,51 @@ fn path_has_component_suffix(path: &StandardizedPath, suffix: &str) -> bool {
 }
 
 #[cfg(feature = "local_fs")]
+fn discover_symlinked_project_skill_files(
+    provider_directory: &Path,
+    matches: &mut Vec<OwnedRepoContent>,
+    entries_scanned: &mut usize,
+    budget: RepoContentsQueryBudget,
+) -> Result<(), RepoContentsQueryError> {
+    let entries = std::fs::read_dir(provider_directory).map_err(|error| {
+        RepoContentsQueryError::QueryFailed {
+            message: error.to_string(),
+        }
+    })?;
+    for entry in entries {
+        if *entries_scanned >= budget.max_entries_scanned {
+            return Err(RepoContentsQueryError::QueryBudgetExceeded {
+                limit: budget.max_entries_scanned,
+            });
+        }
+        *entries_scanned += 1;
+        let skill_directory = entry
+            .map_err(|error| RepoContentsQueryError::QueryFailed {
+                message: error.to_string(),
+            })?
+            .path();
+        if !skill_directory.is_symlink() || !skill_directory.is_dir() {
+            continue;
+        }
+        let skill_file = skill_directory.join("SKILL.md");
+        if !skill_file.is_file() {
+            continue;
+        }
+        let path = StandardizedPath::try_from_local(&skill_file).map_err(|error| {
+            RepoContentsQueryError::QueryFailed {
+                message: error.to_string(),
+            }
+        })?;
+        matches.push(OwnedRepoContent::File {
+            extension: path.extension().map(ToOwned::to_owned),
+            path,
+            ignored: false,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "local_fs")]
 /// Runs bounded authoritative local discovery without mutating any loaded metadata tree.
 pub fn query_local_repo_contents(
     repo_root: &StandardizedPath,
@@ -680,13 +732,18 @@ pub fn query_local_repo_contents(
                 message: error.to_string(),
             }
         })?;
-        if entry.file_type().is_dir() && query_matches_path(&path, true, query) {
-            matches.push(OwnedRepoContent::Directory {
-                path,
-                ignored: false,
-                loaded: false,
-            });
-        } else if entry.file_type().is_file() && query_matches_path(&path, false, query) {
+        if entry.file_type().is_dir()
+            && matches!(query, RepoMetadataQuery::ProjectSkillFiles { .. })
+            && query_matches_path(&path, true, query)
+        {
+            discover_symlinked_project_skill_files(
+                entry.path(),
+                &mut matches,
+                &mut entries_scanned,
+                budget,
+            )?;
+        }
+        if entry.file_type().is_file() && query_matches_path(&path, false, query) {
             matches.push(OwnedRepoContent::File {
                 extension: path.extension().map(ToOwned::to_owned),
                 path,

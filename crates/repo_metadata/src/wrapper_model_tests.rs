@@ -87,6 +87,71 @@ fn authoritative_local_query_discovers_matches_without_materializing_tree() {
 }
 
 #[test]
+#[cfg(all(feature = "local_fs", unix))]
+fn authoritative_project_skill_query_discovers_symlink_without_materializing_tree() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| DetectedRepositories::default());
+        let model = app.add_model(RepoMetadataModel::new);
+        let repo_dir = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+        let repo = dunce::canonicalize(repo_dir.path()).unwrap();
+        let repo_path = StandardizedPath::try_from_local(&repo).unwrap();
+        let agents_directory = StandardizedPath::try_from_local(&repo.join(".agents")).unwrap();
+        let provider_directory =
+            StandardizedPath::try_from_local(&repo.join(".agents/skills")).unwrap();
+        let symlink_skill_path =
+            StandardizedPath::try_from_local(&repo.join(".agents/skills/linked/SKILL.md")).unwrap();
+        fs::create_dir_all(repo.join(".agents/skills")).unwrap();
+        fs::create_dir_all(target_dir.path().join("linked")).unwrap();
+        fs::write(target_dir.path().join("linked/SKILL.md"), "linked skill").unwrap();
+        std::os::unix::fs::symlink(
+            target_dir.path().join("linked"),
+            repo.join(".agents/skills/linked"),
+        )
+        .unwrap();
+
+        let state = FileTreeState::new(
+            directory(
+                repo_path.clone(),
+                true,
+                vec![directory(
+                    agents_directory,
+                    true,
+                    vec![directory(provider_directory, true, Vec::new())],
+                )],
+            ),
+            Vec::new(),
+            None,
+        );
+        let id = RepositoryIdentifier::local(repo_path.clone());
+        model.update(&mut app, |model, ctx| {
+            model.insert_test_state(repo_path, state, ctx);
+        });
+
+        let query = model.update(&mut app, |model, ctx| {
+            model.get_repo_contents(
+                id.clone(),
+                RepoMetadataQuery::ProjectSkillFiles {
+                    provider_paths: vec![".agents/skills".to_string()],
+                },
+                RepoContentsQueryBudget::default(),
+                None,
+                ctx,
+            )
+        });
+        let contents = query.await.unwrap();
+
+        assert!(contents.iter().any(
+            |content| matches!(content, OwnedRepoContent::File { path, .. } if path == &symlink_skill_path)
+        ));
+        model.read(&app, |model, ctx| {
+            let state = model.get_repository(&id, ctx).unwrap();
+            assert!(!state.entry.contains(&symlink_skill_path));
+        });
+    });
+}
+
+#[test]
 #[cfg(feature = "local_fs")]
 fn authoritative_local_query_enforces_scan_budget_without_materializing_tree() {
     App::test((), |mut app| async move {
@@ -261,6 +326,67 @@ fn fully_loaded_remote_query_uses_loaded_tree_without_remote_provider() {
         assert!(!called.load(Ordering::SeqCst));
         assert!(contents.iter().any(
             |content| matches!(content, OwnedRepoContent::File { path, .. } if path == &match_path)
+        ));
+    });
+}
+
+#[test]
+fn fully_loaded_remote_project_skill_query_uses_remote_provider() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| DetectedRepositories::default());
+        let model = app.add_model(RepoMetadataModel::new);
+        let host_id = HostId::new("host".to_string());
+        let repo_path = StandardizedPath::try_new("/repo").unwrap();
+        let symlink_skill_path =
+            StandardizedPath::try_new("/repo/.agents/skills/linked/SKILL.md").unwrap();
+        let remote_id = RemoteRepositoryIdentifier::new(host_id, repo_path.clone());
+        let id = RepositoryIdentifier::Remote(remote_id.clone());
+        let state = FileTreeState::new(directory(repo_path, true, Vec::new()), Vec::new(), None);
+        model.update(&mut app, |model, ctx| {
+            model.remote.update(ctx, |remote, _| {
+                remote.insert_test_state(remote_id.clone(), state);
+            });
+        });
+
+        let called = Arc::new(AtomicBool::new(false));
+        let called_for_provider = called.clone();
+        let expected_remote_id = remote_id.clone();
+        let expected_skill_path = symlink_skill_path.clone();
+        let provider: RemoteMetadataQueryProvider = Box::new(move |requested_id, query, _| {
+            assert_eq!(requested_id, expected_remote_id);
+            assert_eq!(
+                query,
+                RepoMetadataQuery::ProjectSkillFiles {
+                    provider_paths: vec![".agents/skills".to_string()]
+                }
+            );
+            called_for_provider.store(true, Ordering::SeqCst);
+            let path = expected_skill_path.clone();
+            async move {
+                Ok(vec![OwnedRepoContent::File {
+                    extension: Some("md".to_string()),
+                    path,
+                    ignored: false,
+                }])
+            }
+            .boxed()
+        });
+        let query = model.update(&mut app, |model, ctx| {
+            model.get_repo_contents(
+                id,
+                RepoMetadataQuery::ProjectSkillFiles {
+                    provider_paths: vec![".agents/skills".to_string()],
+                },
+                RepoContentsQueryBudget::default(),
+                Some(provider),
+                ctx,
+            )
+        });
+        let contents = query.await.unwrap();
+
+        assert!(called.load(Ordering::SeqCst));
+        assert!(contents.iter().any(
+            |content| matches!(content, OwnedRepoContent::File { path, .. } if path == &symlink_skill_path)
         ));
     });
 }
