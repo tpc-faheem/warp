@@ -24,6 +24,9 @@ use warp_util::standardized_path::StandardizedPath;
 
 use crate::entry::{BuildTreeError, BuildTreeOptions, Entry, FileId, IgnoredPathStrategy};
 use crate::repository::Repository;
+use crate::standing_queries::{
+    StandingQueryDefinitions, StandingQueryResults, StandingQueryResultsDelta,
+};
 use crate::telemetry::RepoMetadataTelemetryEvent;
 use crate::{gitignores_for_directory, matches_gitignores, RepoMetadataError};
 cfg_if::cfg_if! {
@@ -78,6 +81,11 @@ pub enum RepositoryMetadataEvent {
         /// Specifies whether this event contains a precise delta or requires a conservative
         /// refresh because the entry was replaced without one.
         update_type: MetadataUpdateType,
+    },
+    /// The paths retained for standing queries changed.
+    StandingQueryResultsUpdated {
+        path: StandardizedPath,
+        delta: StandingQueryResultsDelta,
     },
     UpdatingRepositoryFailed {
         path: StandardizedPath,
@@ -137,6 +145,8 @@ impl IndexedRepoState {
 pub struct LocalRepoMetadataModel {
     /// Mapping from repository path to its indexed state.
     repositories: HashMap<StandardizedPath, IndexedRepoState>,
+    /// Stored context-discovery matches, independent from canonical tree materialization.
+    standing_results: HashMap<StandardizedPath, StandingQueryResults>,
     /// Refcounts for lazily-loaded standalone paths tracked in the model.
     lazy_loaded_paths: HashMap<StandardizedPath, usize>,
     /// File system watcher for monitoring changes.
@@ -150,6 +160,8 @@ pub struct LocalRepoMetadataModel {
     /// For example, a consumer can register `.foo/bar` so ignored `.foo`,
     /// `.foo/bar`, and descendants of `.foo/bar` are loaded into the tree.
     ignored_path_interests: Vec<PathBuf>,
+    /// Configured standing-query matchers.
+    standing_query_definitions: StandingQueryDefinitions,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -230,11 +242,13 @@ impl LocalRepoMetadataModel {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
         let mut model = Self {
             repositories: HashMap::new(),
+            standing_results: HashMap::new(),
             lazy_loaded_paths: HashMap::new(),
             #[cfg(feature = "local_fs")]
             watcher: None,
             emit_incremental_updates: false,
             ignored_path_interests: Vec::new(),
+            standing_query_definitions: StandingQueryDefinitions::default(),
         };
         cfg_if::cfg_if! {
             if #[cfg(feature = "local_fs")] {
@@ -290,6 +304,11 @@ impl LocalRepoMetadataModel {
         }
     }
 
+    pub fn set_project_skill_provider_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        self.standing_query_definitions
+            .set_project_skill_provider_paths(paths);
+    }
+
     /// Handles events from the BulkFilesystemWatcher.
     #[cfg(feature = "local_fs")]
     fn handle_watcher_event(
@@ -342,32 +361,55 @@ impl LocalRepoMetadataModel {
                 let repo_path_clone = repo_path.clone();
                 let gitignores_clone = state.gitignores.clone();
                 let ignored_path_interests = self.ignored_path_interests.clone();
+                let standing_query_definitions = self.standing_query_definitions.clone();
                 let lazy_load = self.lazy_loaded_paths.contains_key(&repo_path);
                 ctx.spawn(
                     async move {
-                        let mutations = Self::compute_file_tree_mutations(
-                            &repo_scoped_update,
-                            &gitignores_clone,
-                            &ignored_path_interests,
+                        let (mutations, standing_results, removed_roots) =
+                            Self::compute_file_tree_mutations(
+                                &repo_scoped_update,
+                                &gitignores_clone,
+                                &ignored_path_interests,
+                                &standing_query_definitions,
+                            )
+                            .await;
+                        (
+                            mutations,
+                            standing_results,
+                            removed_roots,
+                            repo_path_clone,
+                            lazy_load,
                         )
-                        .await;
-                        (mutations, repo_path_clone, lazy_load)
                     },
-                    |model, (mutations, repo_path, lazy_load), ctx| {
+                    |model,
+                     (mutations, discovered_results, removed_roots, repo_path, lazy_load),
+                     ctx| {
                         if let Some(IndexedRepoState::Indexed(state)) =
                             model.repositories.get_mut(&repo_path)
                         {
-                            let update = Self::apply_file_tree_mutations(
+                            let mut update = Self::apply_file_tree_mutations(
                                 &mut state.entry,
                                 mutations,
                                 lazy_load,
                                 true,
                             )
                             .expect("update tracking was enabled");
+                            let standing_delta = model
+                                .standing_results
+                                .entry(repo_path.clone())
+                                .or_default()
+                                .replace_subtrees(&removed_roots, discovered_results);
+                            update.standing_results_delta = standing_delta.clone();
                             ctx.emit(RepositoryMetadataEvent::FileTreeEntryUpdated {
-                                path: repo_path,
+                                path: repo_path.clone(),
                                 update_type: MetadataUpdateType::IncrementalUpdate(update.clone()),
                             });
+                            if !standing_delta.is_empty() {
+                                ctx.emit(RepositoryMetadataEvent::StandingQueryResultsUpdated {
+                                    path: repo_path,
+                                    delta: standing_delta,
+                                });
+                            }
                             if model.emit_incremental_updates {
                                 ctx.emit(RepositoryMetadataEvent::IncrementalUpdateReady {
                                     update,
@@ -455,6 +497,7 @@ impl LocalRepoMetadataModel {
         ctx: &mut ModelContext<Self>,
     ) -> Result<(), RepoMetadataError> {
         if self.remove_repository_state(repo_path).is_some() {
+            self.standing_results.remove(repo_path);
             // Unregister from watcher
             #[cfg(feature = "local_fs")]
             {
@@ -483,6 +526,13 @@ impl LocalRepoMetadataModel {
             IndexedRepoState::Pending(_) => None,
             IndexedRepoState::Failed(_) => None,
         }
+    }
+
+    pub fn standing_query_results(
+        &self,
+        repo_path: &StandardizedPath,
+    ) -> Option<&StandingQueryResults> {
+        self.standing_results.get(repo_path)
     }
 
     /// Returns the current [`IndexedRepoState`] for the specified repository or `None` if the
@@ -540,21 +590,29 @@ impl LocalRepoMetadataModel {
             ));
         }
 
-        // Build first-level-only tree.
+        // Build first-level-only tree while collecting standing results across
+        // descendants that are not materialized in the lazy file tree.
         let mut files = Vec::new();
         let mut file_limit = MAX_FILES_PER_REPO;
-        let root_entry = Entry::build_tree(
+        let mut standing_results = StandingQueryResults::default();
+        let root_entry = Entry::build_tree_with_standing_queries(
             &local_path,
             &mut files,
             &mut vec![],
             Some(&mut file_limit),
-            1, // max_depth — only first level
-            0,
-            &IgnoredPathStrategy::Include,
+            BuildTreeOptions {
+                max_depth: 1, // Only first level.
+                current_depth: 0,
+                ignored_path_strategy: &IgnoredPathStrategy::Include,
+                ignored_path_interests: &self.ignored_path_interests,
+            },
+            &mut standing_results,
+            &self.standing_query_definitions,
         )
         .map_err(RepoMetadataError::BuildTree)?;
 
         let state = FileTreeState::new_lazy_loaded(root_entry);
+        self.standing_results.insert(path.clone(), standing_results);
         self.add_repository_internal(path.clone(), state, ctx)?;
         self.lazy_loaded_paths.insert(path.clone(), 1);
         Ok(())
@@ -622,12 +680,22 @@ impl LocalRepoMetadataModel {
         update: &RepoUpdate,
         gitignores: &[Gitignore],
         ignored_path_interests: &[PathBuf],
-    ) -> Vec<FileTreeMutation> {
+        standing_query_definitions: &StandingQueryDefinitions,
+    ) -> (
+        Vec<FileTreeMutation>,
+        StandingQueryResults,
+        Vec<StandardizedPath>,
+    ) {
         let mut mutations = Vec::new();
+        let mut standing_results = StandingQueryResults::default();
+        let mut removed_roots = Vec::new();
 
         // Removals for deleted and moved-from paths
         for path_to_remove in update.deleted.iter().chain(update.moved.values()) {
             mutations.push(FileTreeMutation::Remove(path_to_remove.clone()));
+            if let Ok(path) = StandardizedPath::try_from_local(path_to_remove) {
+                removed_roots.push(path);
+            }
         }
 
         // Additions for new and moved-to paths
@@ -642,7 +710,7 @@ impl LocalRepoMetadataModel {
                 let mut files = Vec::new();
                 let mut gitignores = gitignores.to_owned();
                 let mut file_limit = MAX_FILES_PER_REPO;
-                match Entry::build_tree_with_ignored_path_interests_and_ancestor(
+                match Entry::build_tree_with_standing_queries(
                     path_to_add,
                     &mut files,
                     &mut gitignores,
@@ -653,7 +721,8 @@ impl LocalRepoMetadataModel {
                         ignored_path_strategy: &IgnoredPathStrategy::IncludeLazy,
                         ignored_path_interests,
                     },
-                    is_ignored,
+                    &mut standing_results,
+                    standing_query_definitions,
                 ) {
                     Ok(subtree) => {
                         mutations.push(FileTreeMutation::AddDirectorySubtree {
@@ -670,6 +739,7 @@ impl LocalRepoMetadataModel {
                     }
                 }
             } else {
+                standing_results.record_path(path_to_add, false, standing_query_definitions);
                 let extension = path_to_add
                     .extension()
                     .and_then(|ext| ext.to_str().map(|s| s.to_owned()));
@@ -681,7 +751,7 @@ impl LocalRepoMetadataModel {
             }
         }
 
-        mutations
+        (mutations, standing_results, removed_roots)
     }
 
     /// Phase 2: Applies pre-computed mutations to the file tree on the main thread.
@@ -841,6 +911,7 @@ impl LocalRepoMetadataModel {
             repo_path: root_entry.root_directory().as_ref().clone(),
             remove_entries,
             update_entries,
+            standing_results_delta: StandingQueryResultsDelta::default(),
         })
     }
 
@@ -934,6 +1005,7 @@ impl LocalRepoMetadataModel {
         let repo_path_for_build = local_path;
         let gitignores_for_build = gitignores.clone();
         let ignored_path_interests = self.ignored_path_interests.clone();
+        let standing_query_definitions = self.standing_query_definitions.clone();
         let repo_path_str_for_log = std_path.to_string();
         let std_path_for_completion = std_path;
         let repository_handle_for_completion = repository_handle.clone();
@@ -946,10 +1018,11 @@ impl LocalRepoMetadataModel {
                 // state if the full-depth build is partially populated before
                 // it hits the file limit.
                 let initial_gitignores = gitignores_for_build.clone();
+                let mut standing_results = StandingQueryResults::default();
 
                 let mut file_limit = MAX_FILES_PER_REPO;
 
-                let mut build_result = Entry::build_tree_with_ignored_path_interests(
+                let mut build_result = Entry::build_tree_with_standing_queries(
                     &repo_path_for_build,
                     &mut files,
                     &mut gitignores_for_build,
@@ -960,6 +1033,8 @@ impl LocalRepoMetadataModel {
                         ignored_path_strategy: &IgnoredPathStrategy::IncludeLazy,
                         ignored_path_interests: &ignored_path_interests,
                     },
+                    &mut standing_results,
+                    &standing_query_definitions,
                 );
 
                 // Repos with more than MAX_FILES_PER_REPO tracked files can't
@@ -974,7 +1049,8 @@ impl LocalRepoMetadataModel {
                 if matches!(build_result, Err(BuildTreeError::ExceededMaxFileLimit)) {
                     files.clear();
                     gitignores_for_build = initial_gitignores;
-                    build_result = Entry::build_tree_with_ignored_path_interests(
+                    standing_results = StandingQueryResults::default();
+                    build_result = Entry::build_tree_with_standing_queries(
                         &repo_path_for_build,
                         &mut files,
                         &mut gitignores_for_build,
@@ -985,6 +1061,8 @@ impl LocalRepoMetadataModel {
                             ignored_path_strategy: &IgnoredPathStrategy::IncludeLazy,
                             ignored_path_interests: &ignored_path_interests,
                         },
+                        &mut standing_results,
+                        &standing_query_definitions,
                     );
                     if build_result.is_ok() {
                         indexed_with_limit = true;
@@ -999,6 +1077,7 @@ impl LocalRepoMetadataModel {
                     std_path_for_completion,
                     repository_handle_for_completion,
                     indexed_with_limit,
+                    standing_results,
                 )
             },
             move |model: &mut LocalRepoMetadataModel,
@@ -1010,10 +1089,14 @@ impl LocalRepoMetadataModel {
                       std_repo_path,
                       repository_handle,
                       indexed_with_limit,
-                  ): (Result<Entry, _>, Vec<crate::entry::FileMetadata>, _, String, StandardizedPath, ModelHandle<Repository>, bool),
+                      standing_results,
+                  ): (Result<Entry, _>, Vec<crate::entry::FileMetadata>, _, String, StandardizedPath, ModelHandle<Repository>, bool, StandingQueryResults),
                   ctx| {
                 match build_result {
                     Ok(root_entry) => {
+                        model
+                            .standing_results
+                            .insert(std_repo_path.clone(), standing_results);
                         let state =
                             FileTreeState::new(root_entry, gitignores_for_build, Some(repository_handle));
 
@@ -1112,6 +1195,7 @@ impl LocalRepoMetadataModel {
         error: RepoMetadataError,
         ctx: &mut ModelContext<Self>,
     ) {
+        self.standing_results.remove(&repo_path);
         self.replace_repository_state(repo_path.clone(), IndexedRepoState::Failed(error));
         ctx.emit(RepositoryMetadataEvent::UpdatingRepositoryFailed { path: repo_path });
     }
@@ -1172,6 +1256,14 @@ impl LocalRepoMetadataModel {
     /// Insert a repository state directly for testing purposes.
     pub fn insert_test_state(&mut self, repo_path: StandardizedPath, state: FileTreeState) {
         self.replace_repository_state(repo_path, IndexedRepoState::Indexed(state));
+    }
+
+    pub fn insert_test_standing_results(
+        &mut self,
+        repo_path: StandardizedPath,
+        standing_results: StandingQueryResults,
+    ) {
+        self.standing_results.insert(repo_path, standing_results);
     }
 }
 

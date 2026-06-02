@@ -12,6 +12,8 @@ use notify_debouncer_full::notify::WatchFilter;
 use thiserror::Error;
 use warp_util::standardized_path::StandardizedPath;
 
+use crate::standing_queries::{StandingQueryDefinitions, StandingQueryResults};
+
 /// Maximum file size allowed for treesitter parsing (3MB).
 const MAX_FILE_SIZE: usize = 3 * 1000 * 1000;
 
@@ -129,11 +131,36 @@ impl Entry {
                 ignored_path_interests: &[],
             },
             false,
+            None,
+            None,
+        )
+    }
+
+    /// Builds the materialized tree and standing results during the same filesystem traversal.
+    pub(crate) fn build_tree_with_standing_queries(
+        path: impl Into<PathBuf>,
+        files: &mut Vec<FileMetadata>,
+        gitignores: &mut Vec<Gitignore>,
+        remaining_file_quota: Option<&mut usize>,
+        options: BuildTreeOptions<'_>,
+        standing_results: &mut StandingQueryResults,
+        definitions: &StandingQueryDefinitions,
+    ) -> Result<Self, BuildTreeError> {
+        Self::build_tree_with_ignored_path_interests_and_ancestor(
+            path,
+            files,
+            gitignores,
+            remaining_file_quota,
+            options,
+            false,
+            Some(standing_results),
+            Some(definitions),
         )
     }
 
     /// Builds a tree of entries from a given path, loading ignored paths that match
     /// one of the supplied component-sequence interests instead of leaving them lazy.
+    #[allow(dead_code)]
     pub(crate) fn build_tree_with_ignored_path_interests(
         path: impl Into<PathBuf>,
         files: &mut Vec<FileMetadata>,
@@ -148,6 +175,8 @@ impl Entry {
             remaining_file_quota,
             options,
             false,
+            None,
+            None,
         )
     }
 
@@ -174,6 +203,8 @@ impl Entry {
                 ignored_path_interests: &[],
             },
             ancestor_is_ignored,
+            None,
+            None,
         )
     }
 
@@ -185,6 +216,8 @@ impl Entry {
         mut remaining_file_quota: Option<&mut usize>,
         options: BuildTreeOptions<'_>,
         ancestor_is_ignored: bool,
+        mut standing_results: Option<&mut StandingQueryResults>,
+        definitions: Option<&StandingQueryDefinitions>,
     ) -> Result<Self, BuildTreeError> {
         let curr_path: PathBuf = path.into();
         let is_dir = curr_path.is_dir();
@@ -208,6 +241,10 @@ impl Entry {
                 &*gitignores,
                 false, /* check_ancestors */
             );
+
+        if let (Some(results), Some(definitions)) = (standing_results.as_deref_mut(), definitions) {
+            results.record_path(&curr_path, is_dir, definitions);
+        }
 
         // If we've reached the max depth, force lazy-loading even of non-ignored folders.
         let mut lazy_load = options.current_depth >= options.max_depth;
@@ -234,6 +271,11 @@ impl Entry {
 
         if is_dir {
             if lazy_load {
+                if let (Some(results), Some(definitions)) =
+                    (standing_results.as_deref_mut(), definitions)
+                {
+                    Self::collect_standing_descendants(&curr_path, results, definitions);
+                }
                 return Ok(Self::Directory(DirectoryEntry {
                     children: vec![],
                     path: StandardizedPath::from_local_absolute_unchecked(&curr_path),
@@ -279,6 +321,8 @@ impl Entry {
                                 remaining_file_quota.as_deref_mut(),
                                 options.child(),
                                 path_is_ignored,
+                                standing_results.as_deref_mut(),
+                                definitions,
                             ) {
                                 Ok(entry) => Some(entry),
                                 Err(BuildTreeError::ExceededMaxFileLimit) => {
@@ -315,6 +359,38 @@ impl Entry {
             Ok(Self::File(metadata))
         } else {
             Err(BuildTreeError::Symlink)
+        }
+    }
+
+    fn collect_standing_descendants(
+        directory: &Path,
+        results: &mut StandingQueryResults,
+        definitions: &StandingQueryDefinitions,
+    ) {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_symlink() && path.is_dir() {
+                continue;
+            }
+            let path = if path.is_symlink() {
+                path
+            } else {
+                match dunce::canonicalize(path) {
+                    Ok(path) => path,
+                    Err(_) => continue,
+                }
+            };
+            if is_git_internal_path(&path) {
+                continue;
+            }
+            let is_directory = path.is_dir();
+            results.record_path(&path, is_directory, definitions);
+            if is_directory {
+                Self::collect_standing_descendants(&path, results, definitions);
+            }
         }
     }
 
