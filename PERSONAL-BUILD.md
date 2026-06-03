@@ -55,19 +55,45 @@ bundle + an ad-hoc signature.
 
 ```bash
 cargo install cargo-bundle
-cargo bundle --release --bin warp-oss
-# → target/release/bundle/osx/WarpOss.app  (icon baked in)
+cd app && cargo bundle --release --bin warp-oss && cd ..   # MUST run from app/ (bundle metadata lives there)
+# → target/release/bundle/osx/WarpOss.app  (+ a WarpOss.dmg)
 
 # ad-hoc sign so Gatekeeper lets it launch, then install:
 codesign --force --deep --sign - target/release/bundle/osx/WarpOss.app
 cp -R target/release/bundle/osx/WarpOss.app /Applications/
+xattr -dr com.apple.quarantine /Applications/WarpOss.app   # first launch only
+open /Applications/WarpOss.app
+```
 
-# first launch only (unidentified developer): right-click → Open, or:
-xattr -dr com.apple.quarantine /Applications/WarpOss.app
+Identity: `dev.warp.WarpOss`, name `WarpOss`. Runs the same code as the release
+binary (assets are embedded via rust-embed, so the bundle is self-contained).
+
+### Custom (tinted) icon
+
+The stock bundle uses Warp's OSS icon — identical to real Warp in the Dock. To
+tint it (violet, to mark it as the personal/dev build) and keep transparency:
+
+```bash
+python3 - <<'PY'
+from PIL import Image
+b=Image.open("app/channels/oss/icon/no-padding/512x512.png").convert("RGBA")
+a=b.getchannel("A")
+tint=Image.composite(Image.new("RGBA",b.size,(138,79,245,130)),Image.new("RGBA",b.size,(0,0,0,0)),a)
+Image.alpha_composite(b,tint).save("/tmp/tint.png")
+PY
+mkdir -p /tmp/AppIcon.iconset
+for s in 16 32 128 256 512; do
+  sips -z $s $s /tmp/tint.png --out /tmp/AppIcon.iconset/icon_${s}x${s}.png >/dev/null
+  sips -z $((s*2)) $((s*2)) /tmp/tint.png --out /tmp/AppIcon.iconset/icon_${s}x${s}@2x.png >/dev/null
+done
+iconutil -c icns /tmp/AppIcon.iconset -o WarpOss.icns
+cp WarpOss.icns /Applications/WarpOss.app/Contents/Resources/WarpOss.icns
+codesign --force --deep --sign - /Applications/WarpOss.app   # re-sign after editing resources
+touch /Applications/WarpOss.app && killall Dock              # refresh icon cache
 ```
 
 Rebuilding the binary later doesn't auto-update the installed `.app` — re-run
-`cargo bundle` + `cp -R` (or point the bundle's executable at the symlink).
+`cargo bundle` + `cp -R` (then re-apply the icon + re-sign).
 
 ## Tab tear-off — how to use it
 
